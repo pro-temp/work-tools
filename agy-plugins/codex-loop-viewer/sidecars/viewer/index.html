@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Loop</title>
+<script src="/preload.js"></script>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="top-bar">
+    <div class="top-left">
+      <span id="live-dot" class="live-dot" title="等待连接"></span>
+      <select id="run-select" class="run-select" aria-label="选择 Codex 派单会话"></select>
+    </div>
+    <div class="top-actions">
+      <button id="btn-open-codex" type="button" class="btn primary" title="在 Codex 桌面端打开当前会话" disabled>Codex</button>
+      <button id="btn-copy-link" type="button" class="btn" title="复制 codex:// 会话链接" disabled>复制链接</button>
+      <button id="btn-menu" type="button" class="btn icon-btn" popovertarget="viewer-menu" title="更多操作" aria-label="更多操作">⋯</button>
+    </div>
+  </header>
+
+  <div id="viewer-menu" popover="auto" class="menu-popover">
+    <button id="menu-expand-all" type="button" class="menu-item">展开所有步骤详情</button>
+    <button id="menu-collapse-all" type="button" class="menu-item">收起所有步骤详情</button>
+    <hr class="menu-sep">
+    <label class="menu-check">
+      <input id="opt-messages-only" type="checkbox">
+      <span>仅看消息（隐藏工具行）</span>
+    </label>
+    <label class="menu-check">
+      <input id="opt-autofollow" type="checkbox" checked>
+      <span>运行中自动滚到底部</span>
+    </label>
+    <label class="menu-check">
+      <input id="opt-show-echo" type="checkbox">
+      <span>展开回执重复 JSON 文本</span>
+    </label>
+    <hr class="menu-sep">
+    <button id="menu-copy-rundir" type="button" class="menu-item">复制运行目录路径</button>
+    <button id="menu-refresh" type="button" class="menu-item">立即刷新</button>
+  </div>
+
+  <main id="app" class="app">
+    <p class="empty">正在读取 Codex 派单记录…</p>
+  </main>
+
+  <dialog id="raw-dialog" class="raw-dialog" aria-labelledby="raw-dialog-title">
+    <div class="raw-dialog-head">
+      <div class="raw-dialog-meta">
+        <span id="raw-dialog-title" class="raw-dialog-title">原始文件</span>
+        <span id="raw-dialog-sub" class="raw-dialog-sub"></span>
+      </div>
+      <div class="raw-dialog-actions">
+        <button id="raw-load-more" type="button" class="btn primary" hidden>加载下一段</button>
+        <button id="raw-copy" type="button" class="btn">复制原文</button>
+        <button id="raw-close" type="button" class="btn">关闭</button>
+      </div>
+    </div>
+    <pre id="raw-content" class="raw-content"></pre>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

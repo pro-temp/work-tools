@@ -1,0 +1,12 @@
+{
+  "name": "codex-loop-viewer",
+  "displayName": "Codex Loop",
+  "version": "1.0.0",
+  "description": "在 Antigravity 右侧栏实时、原样查看 codex-loop 派单中 AGY 与 Codex 的完整交互、命令输出、结构化回执与原生 rollout 记录。",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "用 codex-loop 排查并修复当前问题",
+    "让 codex 反向审查我当前的 git diff",
+    "和 codex 跑一遍双盲方案再决定怎么改"
+  ]
+}

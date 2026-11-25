@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT 白龙娘生图"
+  short_description: "按原设绘制 GPT 白龙娘头像、立绘和主题插画，逐张核对角色特征"
+  default_prompt: "用 $gpt-dragon-image 画一张 GPT 白龙娘抱着金币、忍不住偷笑的头像。"

@@ -1,0 +1,3 @@
+interface:
+  display_name: "前端 Web 平台指导"
+  short_description: "按项目浏览器目标处理 CSS 布局、弹层焦点和性能，兼容现有组件"

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex Loop"
+  short_description: "Antigravity 与 Codex 双向协作闭环（实现、双盲方案、只读审查）"
+  default_prompt: "按 $codex-loop 执行端约定完成当前任务，不要递归调用 run-codex.ps1。"
+policy:
+  allow_implicit_invocation: false

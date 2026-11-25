@@ -1,0 +1,137 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CodexHandoff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "root_cause",
+    "changed_files",
+    "guards_and_fallbacks",
+    "verification",
+    "assumptions",
+    "design_concerns",
+    "unverified_gaps",
+    "questions",
+    "permission_request"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["done", "needs_input", "needs_permission"],
+      "description": "done = implementation, independent plan, or review completed and verified; needs_input = blocked on an unresolvable user decision or concrete code evidence proving the requested premise/approach is broken; needs_permission = blocked on sandbox, external, or irreversible action requiring approval."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Direct factual summary of changes made, independent plan or review verdict, or why execution paused. No hedging or disclaimers."
+    },
+    "root_cause": {
+      "type": ["string", "null"],
+      "description": "Root cause for bug fixes or failures; null when not applicable."
+    },
+    "changed_files": {
+      "type": "array",
+      "description": "Files created, modified, or deleted in this run.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "change"],
+        "properties": {
+          "path": { "type": "string" },
+          "change": { "type": "string" }
+        }
+      }
+    },
+    "guards_and_fallbacks": {
+      "type": "array",
+      "description": "Declare EVERY added null/type check, optional chaining, fallback default, try/catch, lock, retry, or compatibility branch, with concrete reachable evidence.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["location", "guard", "evidence"],
+        "properties": {
+          "location": { "type": "string", "description": "file:line or symbol" },
+          "guard": { "type": "string", "description": "Defensive check or fallback added" },
+          "evidence": { "type": "string", "description": "Reachable caller, API contract, or repro showing why it is required" }
+        }
+      }
+    },
+    "verification": {
+      "type": "array",
+      "description": "Verification commands actually executed during this run.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code", "result"],
+        "properties": {
+          "command": { "type": "string" },
+          "exit_code": { "type": "integer" },
+          "result": { "type": "string" }
+        }
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Reversible decisions resolved autonomously from codebase evidence.",
+      "items": { "type": "string" }
+    },
+    "design_concerns": {
+      "type": "array",
+      "description": "Evidence-backed design flaws, mismatched assumptions, review findings (prefix issue with [BLOCKING] or [ADVISORY] during review), or better alternatives noticed in the codebase. Leave empty [] if none; never pad with hypothetical disclaimers.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["issue", "evidence", "suggestion"],
+        "properties": {
+          "issue": { "type": "string" },
+          "evidence": { "type": "string", "description": "Concrete file:line, caller, or contract proving the concern" },
+          "suggestion": { "type": "string" }
+        }
+      }
+    },
+    "unverified_gaps": {
+      "type": "array",
+      "description": "Anything genuinely unverified and the concrete reason. Empty array if fully verified.",
+      "items": { "type": "string" }
+    },
+    "questions": {
+      "type": "array",
+      "description": "Populate ONLY when status is needs_input for decisions that cannot be resolved from code.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question", "facts_found", "recommended_option", "alternatives"],
+        "properties": {
+          "question": { "type": "string" },
+          "facts_found": { "type": "string" },
+          "recommended_option": { "type": "string" },
+          "alternatives": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "permission_request": {
+      "description": "Populate ONLY when status is needs_permission; otherwise null.",
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "commands_or_paths", "reason", "reversible"],
+          "properties": {
+            "action": { "type": "string" },
+            "commands_or_paths": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "reason": { "type": "string" },
+            "reversible": { "type": "boolean" }
+          }
+        },
+        { "type": "null" }
+      ]
+    }
+  }
+}

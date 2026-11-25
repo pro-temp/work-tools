@@ -1,0 +1,4 @@
+interface:
+  display_name: "Confluence Flow"
+  short_description: "检索 Confluence 页面、精确修改章节并管理附件和页面树"
+  default_prompt: "用 $confluence-flow 找到发布流程页面，并列出可以编辑的章节。"

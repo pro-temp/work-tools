@@ -1,0 +1,5 @@
+{
+  "name": "shared-agent-skills",
+  "displayName": "Shared Agent Skills",
+  "description": "Selected cross-agent skills linked from ~/.agents/skills."
+}

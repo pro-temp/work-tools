@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jira Flow"
+  short_description: "用自然语言查询 Jira 工单、核对变更历史并预览和提交更新"
+  default_prompt: "用 $jira-flow 查询我当前迭代的工单，并列出最近的状态变化。"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Usage Query"
+  short_description: "Query coding-agent token usage from natural language"
+  default_prompt: "Check today's Kimi token usage"
