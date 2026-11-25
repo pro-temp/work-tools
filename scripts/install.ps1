@@ -40,8 +40,7 @@ $sharedBridgeSkills = @(
   'frontend-web-platform-guidance',
   'instruction-audit',
   'jira-flow',
-  'usage-query',
-  'weekly-monthly-report-summary'
+  'usage-query'
 )
 
 $mappings = [System.Collections.Generic.List[hashtable]]::new()

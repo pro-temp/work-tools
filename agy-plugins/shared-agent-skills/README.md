@@ -6,7 +6,7 @@ Antigravity 本地桥接插件，将 `~/.agents/skills/` 中精选的跨工具 S
 
 ## 推荐链接清单
 
-来自本仓库 `skills/`（8 个，不含直接放在 `~/.gemini/config/skills/` 的 `codex-loop` 和按需使用的 3 个生图 Skill）：
+来自本仓库 `skills/`（7 个，不含直接放在 `~/.gemini/config/skills/` 的 `codex-loop` 和按需使用的 `gpt-dragon-image`）：
 
 - `bun-effect-drizzle-conventions`
 - `business-frontend-ai-navigation`
@@ -15,7 +15,6 @@ Antigravity 本地桥接插件，将 `~/.agents/skills/` 中精选的跨工具 S
 - `instruction-audit`
 - `jira-flow`
 - `usage-query`
-- `weekly-monthly-report-summary`
 
 其余公司私有/本机专用或第三方技能（未收录在本仓库）可按需在本机额外链接。
 
@@ -32,8 +31,7 @@ $names = @(
   'frontend-web-platform-guidance',
   'instruction-audit',
   'jira-flow',
-  'usage-query',
-  'weekly-monthly-report-summary'
+  'usage-query'
 )
 
 foreach ($name in $names) {

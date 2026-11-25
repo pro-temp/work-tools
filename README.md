@@ -6,7 +6,7 @@
 
 ```text
 work-tools/
-├── skills/                             # 自建跨 Agent Skills（12 个）
+├── skills/                             # 自建跨 Agent Skills（9 个）
 │   ├── bun-effect-drizzle-conventions/ # Bun / Effect / Drizzle 编码约定（从全局指令拆出）
 │   ├── business-frontend-ai-navigation/# 业务前端仓库 AI 导航改造
 │   ├── codex-loop/                     # Antigravity + Codex 双向协作闭环
@@ -15,10 +15,7 @@ work-tools/
 │   ├── gpt-dragon-image/               # GPT 白龙娘角色绘图与验收
 │   ├── instruction-audit/              # AGENTS.md / CLAUDE.md / SKILL.md 指令审计与精简
 │   ├── jira-flow/                      # Jira 工单查询/创建/流转 CLI
-│   ├── usage-query/                    # 自然语言查询本地 ccusage Token 用量
-│   ├── weekly-monthly-report-summary/  # 周报 / 月报汇总
-│   ├── whalechan-image-character/      # DeepSeek 鲸鱼娘角色插画生成工作流
-│   └── whalechan-image-comic/          # DeepSeek 鲸鱼娘多格漫画生成工作流
+│   └── usage-query/                    # 自然语言查询本地 ccusage Token 用量
 ├── agy-plugins/                        # 自建 Antigravity（AGY）插件（3 个）
 │   ├── codex-loop-viewer/              # 右侧栏 Sidecar：实时原样查看 codex-loop 交互
 │   ├── next-step-advisor/              # 回复末尾下一步建议 + /next 原生选项卡片
@@ -50,7 +47,7 @@ pwsh -File .\scripts\install.ps1 -Status
 
 | 类型 | 仓库路径 | 本机运行目录 |
 | --- | --- | --- |
-| 通用 Skills（11 个） | `skills/<name>` | `~/.agents/skills/<name>` |
+| 通用 Skills（8 个） | `skills/<name>` | `~/.agents/skills/<name>` |
 | `codex-loop` Skill | `skills/codex-loop` | `~/.gemini/config/skills/codex-loop`（`~/.agents/skills/codex-loop` 软链指向此处） |
 | AGY 插件 | `agy-plugins/<name>` | `~/.gemini/config/plugins/<name>`（`shared-agent-skills` 仅软链 `plugin.json`） |
 | 跨 Agent 全局规则 | `rules/agents/AGENTS.md`（及 `ATTRIBUTION.md`） | `~/.agents/AGENTS.md`（`GEMINI.md` / `.codex/AGENTS.md` 软链至此，Claude `CLAUDE.md` 引用至此） |
@@ -59,5 +56,4 @@ pwsh -File .\scripts\install.ps1 -Status
 ## 隐私与凭据说明
 
 - `jira-flow` 与 `confluence-flow` 的连接配置与密钥保存在用户目录 `~/.config/{jira-flow,confluence-flow}/config.json` 或环境变量中，本仓库不包含任何真实凭据。
-- `whalechan-*` 绘图脚本从环境变量（`OPENAI_API_KEY`、`GEMINI_API_KEY` / `GOOGLE_API_KEY`、`ARK_API_KEY`）读取密钥，不内置任何凭据。
 - 含公司私有包名或本机业务路径的 Skill 未纳入本仓库。
