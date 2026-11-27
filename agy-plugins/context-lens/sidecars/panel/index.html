@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Context Lens</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/preload.js"></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="toolbar">
+    <div class="model"><span id="live" class="live"></span><span id="model">Context Lens</span></div>
+    <button id="handoff" class="primary" disabled>交接文档</button>
+    <button id="quick-copy" disabled>复制交接</button>
+    <button class="more" popovertarget="menu" aria-label="更多操作">⋯</button>
+    <div id="menu" popover="auto">
+      <button id="copy-cli" disabled>复制 CLI 文本报告</button>
+      <button id="refresh">立即刷新</button>
+    </div>
+  </header>
+  <main>
+    <p class="notice" id="notice" role="status">正在读取当前会话…</p>
+    <div id="report" hidden>
+      <section class="hero" aria-labelledby="usage-title">
+        <div class="hero-head"><h1 id="usage-title">上下文占用</h1><span class="unit">TOKEN</span></div>
+        <div class="instrument">
+          <svg id="donut" viewBox="0 0 220 220" role="group" aria-label="模型原生窗口占用分类">
+            <circle class="track" cx="110" cy="110" r="88"/>
+            <circle class="inner-track" cx="110" cy="110" r="74"/>
+            <g id="arcs" transform="rotate(-90 110 110)"></g>
+            <g id="marker" visibility="hidden">
+              <title>单次请求压缩预算</title>
+              <path class="marker-base" d="M110 11v18"/><path class="marker-tip" d="M110 10v18"/>
+            </g>
+          </svg>
+          <div class="dial" aria-hidden="true">
+            <span class="dial-caption" id="dial-label">原生窗口</span>
+            <strong class="dial-value" id="dial-value">—</strong>
+            <span class="dial-detail" id="dial-detail"></span>
+            <span class="state" id="state"></span>
+          </div>
+        </div>
+        <div class="budget" id="budget" hidden>
+          <div class="budget-line"><span>单次请求压缩预算</span><strong id="budget-pct"></strong></div>
+          <div class="meter"><i id="budget-fill"></i></div>
+          <div id="budget-count" class="budget-count"></div>
+        </div>
+      </section>
+      <section class="breakdown" aria-labelledby="breakdown-title">
+        <h2 id="breakdown-title">占用明细</h2>
+        <h3>对话内容</h3><div id="chat-rows"></div>
+        <h3>系统与扩展</h3><div id="system-rows"></div>
+        <div class="balance"><span>剩余空间</span><strong id="free"></strong></div>
+        <div class="balance" id="buffer-row" hidden><span>检查点缓冲（不计入占用）</span><strong id="buffer"></strong></div>
+      </section>
+      <section class="checkpoint" id="checkpoint" hidden>
+        <div class="section-head"><h2 id="checkpoint-name"></h2><span class="pill">上下文中</span></div>
+        <p id="checkpoint-intent"></p><small id="checkpoint-history"></small>
+      </section>
+      <section class="context-files" aria-labelledby="files-title"><h2 id="files-title">上下文文件</h2><div id="file-groups"></div></section>
+    </div>
+  </main>
+  <dialog id="handoff-dialog" closedby="any" aria-labelledby="handoff-title">
+    <header class="dialog-head"><h1 id="handoff-title">会话交接文档</h1><button id="close" autofocus aria-label="关闭交接文档">关闭</button></header>
+    <fieldset class="modes"><legend>交接文档模式</legend>
+      <label><input type="radio" name="mode" value="compact" checked>精简版<span>（推荐新开会话）</span></label>
+      <label><input type="radio" name="mode" value="full">完整版</label>
+    </fieldset>
+    <div class="metrics" id="metrics"></div>
+    <pre id="preview" tabindex="0" aria-label="Markdown 预览"></pre>
+    <footer class="dialog-footer">
+      <output id="feedback"></output>
+      <button id="copy-md" class="primary" disabled>复制 Markdown</button>
+      <button id="download" disabled>导出到 Downloads</button>
+      <button id="save" disabled>存到会话目录并打开</button>
+    </footer>
+  </dialog>
+  <div id="toast" role="status"></div>
+</body>
+</html>
+

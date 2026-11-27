@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Context Lens</title>
+  <rect x="12" y="12" width="104" height="104" rx="27" fill="#16212c" stroke="#64748b" stroke-width="2"/>
+  <g transform="rotate(-90 64 64)" fill="none" stroke-width="11">
+    <circle cx="64" cy="64" r="33" stroke="#344454"/>
+    <circle cx="64" cy="64" r="33" pathLength="100" stroke="#60a5fa" stroke-dasharray="32 68"/>
+    <circle cx="64" cy="64" r="33" pathLength="100" stroke="#50d7b5" stroke-dasharray="35 65" stroke-dashoffset="-35"/>
+    <circle cx="64" cy="64" r="33" pathLength="100" stroke="#f1bd69" stroke-dasharray="13 87" stroke-dashoffset="-73"/>
+  </g>
+  <circle cx="64" cy="64" r="13" fill="none" stroke="#deeee9" stroke-width="3"/>
+</svg>

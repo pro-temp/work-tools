@@ -16,8 +16,9 @@ work-tools/
 │   ├── instruction-audit/              # AGENTS.md / CLAUDE.md / SKILL.md 指令审计与精简
 │   ├── jira-flow/                      # Jira 工单查询/创建/流转 CLI
 │   └── usage-query/                    # 自然语言查询本地 ccusage Token 用量
-├── agy-plugins/                        # 自建 Antigravity（AGY）插件（3 个）
+├── agy-plugins/                        # 自建 Antigravity（AGY）插件（4 个）
 │   ├── codex-loop-viewer/              # 右侧栏 Sidecar：实时原样查看 codex-loop 交互
+│   ├── context-lens/                   # 上下文占用环形图与本地 Markdown 会话交接
 │   ├── next-step-advisor/              # 回复末尾下一步建议 + /next 原生选项卡片
 │   └── shared-agent-skills/            # 将 ~/.agents/skills 中精选技能桥接到 AGY
 ├── rules/                              # 自建全局规则（2 份）

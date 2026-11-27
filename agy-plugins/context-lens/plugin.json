@@ -1,0 +1,8 @@
+{
+  "name": "context-lens",
+  "displayName": "Context Lens",
+  "version": "1.0.0",
+  "description": "查看当前会话的上下文占用、压缩预算与检查点，复制或导出本地 Markdown 交接文档。",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": ["查看当前上下文占用", "查看请求压缩预算", "预览当前会话交接文档"]
+}
