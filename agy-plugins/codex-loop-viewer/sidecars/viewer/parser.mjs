@@ -407,24 +407,39 @@ function runSettingsMeta(turns, activeTurn) {
   };
 }
 
-function summarizeRunDir(runDir, seedMeta, appDataDir) {
-  const statusFiles = listStatusFilesInDir(runDir);
-  if (statusFiles.length === 0) return null;
+const VALID_STATUS_STATES = new Set(['running', 'finished', 'failed', 'stopped']);
 
-  const statuses = [];
-  for (const sf of statusFiles) {
-    const parsed = readCachedJson(sf.path);
-    if (!parsed) continue;
-    statuses.push({ file: sf, data: parsed });
+function isCodexLoopStatusData(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return false;
+  if (typeof d.state !== 'string' || !VALID_STATUS_STATES.has(d.state)) return false;
+  if (typeof d.started_at !== 'string' || !d.started_at.trim()) return false;
+  // Require codex-loop runtime fields or bootStatus shape (running + valid runner_pid) so unrelated *.status.json fixtures in scratch/ are ignored.
+  if (d.work_dir || d.run_dir || d.task_kind || d.cli_path || d.events_file || d.handoff_file || d.session_id || d.attempted_session_id) {
+    return true;
   }
-  if (statuses.length === 0) return null;
+  return d.state === 'running' && Number.isInteger(d.runner_pid) && d.runner_pid > 0;
+}
 
-  statuses.sort((a, b) => {
+function readStatusRecordsInDir(dir) {
+  const statusFiles = listStatusFilesInDir(dir);
+  const records = [];
+  for (const sf of statusFiles) {
+    const data = readCachedJson(sf.path);
+    if (!isCodexLoopStatusData(data)) continue;
+    records.push({ file: sf, data });
+  }
+  records.sort((a, b) => {
     const ta = Date.parse(a.data.started_at || '') || a.file.mtimeMs;
     const tb = Date.parse(b.data.started_at || '') || b.file.mtimeMs;
     if (ta !== tb) return ta - tb;
     return a.file.name.localeCompare(b.file.name);
   });
+  return records;
+}
+
+function summarizeRunDir(runDir, seedMeta, appDataDir) {
+  const statuses = readStatusRecordsInDir(runDir);
+  if (statuses.length === 0) return null;
 
   const first = statuses[0].data;
   const latest = statuses[statuses.length - 1].data;
@@ -483,6 +498,15 @@ function summarizeRunDir(runDir, seedMeta, appDataDir) {
   });
   const activeTurn = turns.findLast((t) => t.effectiveState === 'running');
 
+function pickDefinedField(key, ...objs) {
+  for (const obj of objs) {
+    if (obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, key)) {
+      return obj[key] ?? null;
+    }
+  }
+  return null;
+}
+
   const startedAt = first.started_at || new Date(statuses[0].file.mtimeMs).toISOString();
   const updatedMs = Math.max(
     Date.parse(latest.finished_at || '') || 0,
@@ -495,10 +519,10 @@ function summarizeRunDir(runDir, seedMeta, appDataDir) {
     id: makeRunId(`dir:${normPath(runDir)}`),
     runDir,
     workDir,
-    worktreePath: latest.worktree_path || first.worktree_path || seedMeta?.worktree_path || null,
-    engine: latest.engine || first.engine || seedMeta?.engine || null,
-    batchId: latest.batch_id || first.batch_id || seedMeta?.batch_id || null,
-    subtaskId: latest.subtask_id || first.subtask_id || seedMeta?.subtask_id || null,
+    worktreePath: pickDefinedField('worktree_path', latest, first, seedMeta),
+    engine: pickDefinedField('engine', latest, first, seedMeta),
+    batchId: pickDefinedField('batch_id', latest, first, seedMeta),
+    subtaskId: pickDefinedField('subtask_id', latest, first, seedMeta),
     conversationId,
     sessionId: latestConfirmed?.sessionId || null,
     desktopUrl: latestConfirmed?.desktopUrl || null,
@@ -1289,23 +1313,8 @@ export async function readRunDetail(entry, clientEtag = '') {
     };
   }
 
-  const statusFiles = listStatusFilesInDir(entry.runDir);
-  if (statusFiles.length === 0) return { error: 'missing-files' };
-
-  const statusRecords = [];
-  for (const sf of statusFiles) {
-    const data = readCachedJson(sf.path);
-    if (!data) continue;
-    statusRecords.push({ file: sf, data });
-  }
+  const statusRecords = readStatusRecordsInDir(entry.runDir);
   if (statusRecords.length === 0) return { error: 'missing-files' };
-
-  statusRecords.sort((a, b) => {
-    const ta = Date.parse(a.data.started_at || '') || a.file.mtimeMs;
-    const tb = Date.parse(b.data.started_at || '') || b.file.mtimeMs;
-    if (ta !== tb) return ta - tb;
-    return a.file.name.localeCompare(b.file.name);
-  });
 
   // Single manifest drives both ETag and actual reads (fixes ETag drift & PID liveness detection).
   const manifests = statusRecords.map(({ file, data }, idx) => {
@@ -1395,7 +1404,8 @@ export async function readRunDetail(entry, clientEtag = '') {
       }
       if (matchedRolloutTurns.length > 0) {
         rolloutTurn = matchedRolloutTurns[matchedRolloutTurns.length - 1];
-      } else if (enteredCodexTurn) {
+      } else if (enteredCodexTurn && (!recordedTurnIds || recordedTurnIds.size === 0)) {
+        // Only fall back to prompt/timestamp matching for legacy attempts without native turn_ids.
         rolloutTurn = matchRolloutTurn(
           allRolloutTurns,
           consumed,
@@ -1663,17 +1673,8 @@ export async function readRawFile(entry, turnId, kind, offset = 0, limit = DEFAU
     return { error: 'file-not-found' };
   }
 
-  const statusFiles = listStatusFilesInDir(entry.runDir);
-  const ordered = statusFiles
-    .map((sf) => ({ sf, data: readCachedJson(sf.path) }))
-    .filter((x) => x.data)
-    .sort((a, b) => {
-      const ta = Date.parse(a.data.started_at || '') || a.sf.mtimeMs;
-      const tb = Date.parse(b.data.started_at || '') || b.sf.mtimeMs;
-      return ta !== tb ? ta - tb : a.sf.name.localeCompare(b.sf.name);
-    });
-
-  const turnIdx = ordered.findIndex((x) => x.sf.turnId === turnId);
+  const ordered = readStatusRecordsInDir(entry.runDir);
+  const turnIdx = ordered.findIndex((x) => x.file.turnId === turnId);
   if (turnIdx === -1) return { error: 'file-not-found' };
 
   const files = resolveTurnFiles(entry.runDir, turnId, ordered[turnIdx].data, turnIdx === 0);

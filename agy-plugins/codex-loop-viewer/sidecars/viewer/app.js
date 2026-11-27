@@ -1133,34 +1133,38 @@
     }
   }, { capture: true });
 
-  elActiveCount.addEventListener('click', () => {
-    const running = runsList.filter((r) => r.effectiveState === 'running');
-    if (running.length < 2) return;
-    const idx = running.findIndex((r) => r.id === selectedRunId);
-    const next = running[(idx + 1) % running.length];
-    selectedRunId = next.id;
+  function switchSelectedRun(nextRunId) {
+    selectedRunId = nextRunId;
     userPickedRun = true;
     elSelect.value = selectedRunId;
-    requestPoll(true);
-  });
-
-  elSelect.addEventListener('change', () => {
-    selectedRunId = elSelect.value;
-    userPickedRun = true;
     // Prevent top-bar buttons from acting on the previously rendered run while the newly selected run loads.
     elBtnOpenCodex.disabled = true;
     elBtnCopyLink.disabled = true;
     elLiveDot.className = 'live-dot';
     elLiveDot.title = '切换中…';
     requestPoll(true);
+  }
+
+  elActiveCount.addEventListener('click', () => {
+    const running = runsList.filter((r) => r.effectiveState === 'running');
+    if (running.length < 2) return;
+    const idx = running.findIndex((r) => r.id === selectedRunId);
+    const next = running[(idx + 1) % running.length];
+    switchSelectedRun(next.id);
+  });
+
+  elSelect.addEventListener('change', () => {
+    switchSelectedRun(elSelect.value);
   });
 
   elBtnOpenCodex.addEventListener('click', () => {
-    openCodexSession(currentDetail?.run?.sessionId);
+    if (!currentDetail?.run || currentDetail.run.id !== selectedRunId) return;
+    openCodexSession(currentDetail.run.sessionId);
   });
 
   elBtnCopyLink.addEventListener('click', () => {
-    const url = currentDetail?.run?.desktopUrl;
+    if (!currentDetail?.run || currentDetail.run.id !== selectedRunId) return;
+    const url = currentDetail.run.desktopUrl;
     if (url) copyText(url, '已复制 Codex 会话链接');
   });
 
