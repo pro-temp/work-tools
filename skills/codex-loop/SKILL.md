@@ -53,7 +53,7 @@ description: >-
 
 ### 2. 按作业范围选模式并调用封装脚本
 
-使用 `<skill-dir>\scripts\run-codex.ps1` 调用（脚本直启原生 `codex.exe`、实时无缓冲落盘、按 `-TaskKind` 锁权、续接前校验 `rollout-*.jsonl` 存在性、中断时 `taskkill /T` 清理整棵进程树）：
+使用 `<skill-dir>\scripts\run-codex.ps1` 调用（默认采用每单私有 `codex app-server --listen stdio://` 引擎，保留 `-Engine exec` 兼容回退；跨进程硬限最大并发 2；挂载 Windows Job Object 并在中断时 `taskkill /T` 清理整棵进程树；实时写入 `*.events.jsonl` 与 `*.status.json`、按 `-TaskKind` 锁权、续接前校验 `rollout-*.jsonl` 存在性）：
 
 ```powershell
 pwsh -NoProfile -File "<skill-dir>\scripts\run-codex.ps1" `
@@ -86,22 +86,87 @@ pwsh -NoProfile -File "<skill-dir>\scripts\run-codex.ps1" `
   - **需要沙箱锁死工作区**：传 `-Mode workspace`（可配合 `-AddDir <目录>` 最小放开关联目录）。
 
 其他可选参数（默认不传时，首轮与返工均直接沿用 `~/.codex/config.toml` 与桌面端当前选择）：
+- `-Engine <app-server|exec>`（默认 `app-server`，支持轮中实时纠偏与打断；仅在协议不兼容应急时切 `-Engine exec`）
+- `-MaxConcurrency <数字>`（默认 `2`，跨进程硬上限）
+- `-BatchId <批次ID>` / `-SubtaskId <子单标识>`（并发派多单时关联批次与子单标签，续跑自动继承）
+- `-WorktreePath <独立worktree绝对路径>`（同仓双写并发时指向隔离工作树，续跑自动继承）
 - `-Model <模型名>`（仅在派单显式指定模型时传）
 - `-ReasoningEffort <low|medium|high|xhigh|ultra|max>`（仅在派单显式指定思考档位时传）
 - `-ServiceTier priority`（仅在需要单次强制覆盖 Fast 档位时传）
 - `-RunDir <目录>`（复用同一目录保存首轮基线、各轮 `*.status.json`、实时 `*.events.jsonl` 与回执；复用目录再次传 `-CaptureBaseline` 时不会覆盖已有首轮基线）
 
-Codex 发出 `thread.started` 后，脚本等本地会话文件写入内容，再把直达链接 `desktop_url` 写入本轮 `*.status.json`。新派单默认插到「Codex 派单」第一条，续跑沿用已登记会话的位置。App Server 暂时读不到新会话时，脚本会在本轮运行中补试。快速结束的任务会在收尾时补登记，中断后续跑或换运行目录时会补查。
+新派单默认插到 Codex 桌面端「Codex 派单」第一条，续跑沿用已登记会话的位置。`sidebar_registered` 为 `true` 表示分区登记已处理。点开会话时桌面端可能自动续接，两轮之间点开可能占用下一轮返工需要的写入权。只看进度时读本轮 `*.events.jsonl` 或在右侧栏查看。用户要接手时，停止自动返工并等当前派单退出，再从分区或直达链接继续聊（若绑定了 `worktree`，接手期间保留该目录）。
 
-`sidebar_registered` 为 `true` 表示分区登记已处理。已打开的 Windows 桌面窗口通过自己的 App Server 读取列表，可能稍后才显示新条目。点开会话时桌面端可能自动续接，两轮之间点开可能占用下一轮返工需要的写入权。只看进度时读本轮 `*.events.jsonl`。用户要接手时，停止自动返工并等当前 `codex exec` 退出，再从分区或直达链接继续聊。
+发出链接后，**立即结束本轮工具调用以保持主聊天可接收用户输入**，等待后台派单完成通知再验收。
 
-发出链接后，等待原派单命令的完成通知再验收。
+### 2.5 运行中实时纠偏与打断（`steer-codex.ps1`）
+
+当派单仍在后台运行、用户发消息指出任务跑偏或要求停止时，**不要傻等当前轮结束再 `resume`**，也不要直接强杀进程；主控应立即通过 `<skill-dir>\scripts\steer-codex.ps1` 向持有该轮的 runner 投递控制指令：
+
+- **轮中纠偏转向（默认 `-Action steer`）**：用户说“跑偏了、别改 A 改 B”“补充要求 X”时，直接注入当前活动轮（底层调用 `turn/steer` + `clientUserMessageId` 幂等对账），保住已有上下文与结构化回执：
+  ```powershell
+  pwsh -NoProfile -File "<skill-dir>\scripts\steer-codex.ps1" `
+    -RunDir "<本单运行目录>" `
+    -Action steer `
+    -Message "<精准纠偏指令>"
+  ```
+- **立即硬中止（`-Action interrupt`）**：用户明确喊停（“停”“别做了”）时发送 `turn/interrupt`；若用户要求“停下来改做 Y”，可附带 `-FollowUp "<新指令>"` 让同进程在确认 `interrupted` 终态后原地开启替代轮（或先确认停止、核查已有改动后再另起新轮）：
+  ```powershell
+  pwsh -NoProfile -File "<skill-dir>\scripts\steer-codex.ps1" `
+    -RunDir "<本单运行目录>" `
+    -Action interrupt `
+    [-FollowUp "<停后替代指令>"]
+  ```
+- **目标单路由（并发 2 单时）**：仅有一单在跑时直接投递；有两单在跑时，按用户点名（子单标识/模块/主题）精准路由，仅在确实无法判断目标单时用 1 句话请用户指明再发。
+- **回执状态与兜底**：
+  - `applied_in_turn` → 向用户回报「纠偏已进入本轮」并继续等待原派单完成；
+  - `accepted` / `queued_until_turn_start` → 回报「纠偏已接收，等待进入本轮」；
+  - `already_finished` / `turn_not_active` → 说明原轮已收尾，待拿到终态后直接用 `-SessionId` 常规 `resume` 补发；
+  - `not_controllable`（旧 `-Engine exec`）→ 告知旧引擎不支持轮中纠偏，征得同意后中止或等结束后 `resume`。
+
+### 2.6 受控并发派多单（最大并发 2）与同仓自动 `worktree` 双写隔离
+
+当一个大任务可拆出**互相独立、无前后依赖**的子任务时，主控可同时派发最多 **2 单** Codex 并行执行（脚本层通过跨进程槽位表硬限上限为 `2`，满槽时第 3 单直接返回 `error_kind: "slots_full"` 与当前活跃摘要，由主控排入待派列表，任一单完成后立刻补位）。
+
+**拆单准入条件（必须同时满足）**：
+1. 任务规模足够大，各自有清晰的独立交付物与独立验证命令；
+2. 子任务 B 的输入不依赖子任务 A 尚未写完的代码、公共接口或 Schema；
+3. 两单不共改同一锁文件、生成物或争抢同一本地端口/测试数据库（公共集成验证留待合并后统一跑）。
+
+**执行与隔离流程**：
+1. **只读任务（`plan`/`review`）或不同仓库目录**：直接为每单分配独立 `$RunDir`、传入同一 `-BatchId` 与不同 `-SubtaskId`（如 `A`/`B`），同轮并行启动 2 单并一次性给出两条桌面链接与分工。
+2. **同仓双写（2 个 `implement` 同改一个 Git 仓库）**：**必须使用独立 `git worktree` 物理隔离**，通过 `<skill-dir>\scripts\worktree-codex.ps1` 管理完整生命周期：
+   - **准备隔离工作树**：
+     ```powershell
+     pwsh -NoProfile -File "<skill-dir>\scripts\worktree-codex.ps1" `
+       -Action prepare -RepoDir "<主仓路径>" -BatchId "<批次ID>" -SubtaskId "A"
+     ```
+     - 若主仓存在未提交改动，默认 `-BasePolicy clean` 会返回 `dirty_repo_for_worktree` 与脏文件清单。主控须核对子任务是否依赖这些未提交改动：**依赖则退回串行**；确与子任务无关时再显式传 `-BasePolicy head` 从 `HEAD` 建干净 worktree（若项目需复用未跟踪的依赖目录，可显式传 `-LinkDirs node_modules`；注意 Windows 下 `-LinkDirs` 是**共享可写**目录联接，仅在确认子单不会修改依赖目录或写入 `.cache` 时启用，否则在 worktree 内独立安装/使用独立缓存）。
+   - **隔离派单与独立严审**：将 `prepare` 返回的 `worktree_path` 传给 `run-codex.ps1 -WorkDir "<主仓路径>" -WorktreePath "<worktree_path>" -BatchId "<批次ID>" -SubtaskId "A" -CaptureBaseline -ReportStartup`。任一单先完成即立刻用 `worktree-codex.ps1 -Action inspect -WorktreePath "<path>"` 核对隔离 Diff 与验证结果；需要返工时在**原会话 + 原 worktree** 续跑（脚本自动继承 `worktree_path`）。
+   - **顺序预检集成与清理**：两单都通过严审后，按顺序对每单执行：
+     ```powershell
+     # 先无副作用预检（默认按 prepare 时的 main_head_at_create 校验主仓 HEAD 漂移、脏文件重叠与补丁冲突）
+     pwsh -NoProfile -File "<skill-dir>\scripts\worktree-codex.ps1" `
+       -Action integrate -RepoDir "<主仓路径>" -WorktreePath "<path>" -DryRun
+     # 预检通过后正式应用到主工作区（不自动 git commit；如需显式指定预期主仓 HEAD，可传 -ExpectedMainHead "<main_head_at_create>"）
+     pwsh -NoProfile -File "<skill-dir>\scripts\worktree-codex.ps1" `
+       -Action integrate -RepoDir "<主仓路径>" -WorktreePath "<path>"
+     ```
+     - 遇 `dirty_overlap` / `patch_conflict` / `head_drifted` 时主仓零改动，由主控排查解决后再集成。
+     - 全部集成完成并跑通**主仓联合构建/测试**后，执行清理：
+       ```powershell
+       pwsh -NoProfile -File "<skill-dir>\scripts\worktree-codex.ps1" `
+         -Action cleanup -RepoDir "<主仓路径>" -WorktreePath "<path>" -Force
+       ```
+     - 若某单移交用户在桌面端接手，**禁止清理**其 worktree（脚本也会拒绝清理仍占槽的 worktree）。
 
 ### 3. 核对执行结果与异常/三态分流
 
 脚本结束会输出 JSON 摘要。顶层的 `state`、`task_kind`、`session_id`、`effective`、`error_kind` 和 `handoff` 用于验收，`desktop_url`、`sidebar_registered`、`sidebar_title` 和 `sidebar_error` 分别记录直达链接、分区登记结果、登记时确认的会话名称和桌面登记错误。先核对 `effective` 中生效的模型、思考档位、Fast 档位和权限，仍按 `state` 判断派单结果。
 
 - **运行时故障与预检失败处理**：
+  - `error_kind == "slots_full"`：当前已有 2 个在跑派单（`active_slots` 列出在跑摘要），将其记为主控待派项，待任一在跑单结束后立刻补位启动，不要强行覆盖上限。
+  - `error_kind == "duplicate_run_dir"`：同一 `$RunDir` 已有在跑 worker，检查是否为误重复派单或为新并发子单分配独立 `$RunDir`。
   - `error_kind == "active_writer"` 表示会话正被另一端占用。用户已要求桌面接手时，发回原会话链接并结束自动返工。仍由主控负责时，**新开会话**交接已有进度和结论，沿用同一 `$RunDir` 的首轮基线。按第 2 步从新启动命令取得链接，随返工消息发给用户。
   - `error_kind == "capacity"`（服务端临时满载）：等待 1–2 分钟后用**原 `session_id` 续接重试**，不擅自换模型。
   - `error_kind == "invalid_session"`：检查 `session_id` 是否拼错，核对后再续接。

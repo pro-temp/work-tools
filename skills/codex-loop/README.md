@@ -22,6 +22,7 @@
 
 - **操作系统**：Windows（脚本使用 `taskkill /T` 清理进程树，并集成 Codex Windows Desktop 侧栏登记）
 - **Shell**：PowerShell 7+（`pwsh`，脚本均声明 `#Requires -Version 7`）
+- **Node 运行时**：Node.js（`node.exe`）或 Antigravity 内置 Electron Node 运行时（`agy-node.cmd`），`app-server` 与 `exec` 两种引擎共用
 - **Codex CLI**：已安装并登录 `@openai/codex`（`PATH` 中存在 `codex` 或 `codex.exe`）
 - **主控端**：Antigravity 或其他支持 `SKILL.md` 的 Agent 客户端
 
@@ -115,10 +116,12 @@ pwsh -NoProfile -File "<skill-dir>\scripts\run-codex.ps1" `
 
 ## 核心设计
 
-- **强结构化回执**：通过 [references/codex-handoff.schema.json](./references/codex-handoff.schema.json) 约束 11 个必填字段，强制自报每一条新增防御逻辑及可达证据（`guards_and_fallbacks`）、实跑命令及退出码（`verification`）、代码证据隐患（`design_concerns`），并由脚本校验三态载荷一致性（防止 `needs_input` 空问题或只读任务报告改文件）。
+- **私有 `app-server` 引擎与实时纠偏打断**：默认每单启动独立 `codex app-server --listen stdio://` 子进程并开放本地认证 Named Pipe 控制通道（保留 `-Engine exec` 兼容回退），支持运行中通过 [scripts/steer-codex.ps1](./scripts/steer-codex.ps1) 立即发 `turn/steer` 原地纠偏转向（带 `clientUserMessageId` 幂等对账）或 `turn/interrupt` 优雅中止/换轮，无需干等结束后 `resume`。
+- **硬并发上限 2 与自动 `git worktree` 双写隔离**：通过 Windows Named Pipe 跨进程排他锁与独立槽位表（[scripts/lib/slots.mjs](./scripts/lib/slots.mjs)）硬限最多 2 个在跑派单（满额返回 `slots_full`），配合 Windows Job Object（`KILL_ON_JOB_CLOSE`）防止崩溃孤儿占槽；同仓并发写任务可通过 [scripts/worktree-codex.ps1](./scripts/worktree-codex.ps1) 自动执行 `prepare` / `inspect` / `integrate -DryRun` / `integrate` / `cleanup` 隔离集成闭环（`-LinkDirs` 为共享可写目录联接，仅适用于不会写入依赖目录的子单）。
+- **强结构化回执**：通过 [references/codex-handoff.schema.json](./references/codex-handoff.schema.json) 与 [scripts/lib/schema-validate.mjs](./scripts/lib/schema-validate.mjs) 约束 11 个必填字段，强制自报每一条新增防御逻辑及可达证据（`guards_and_fallbacks`）、实跑命令及退出码（`verification`）、代码证据隐患（`design_concerns`），并校验完整 Schema 与三态载荷一致性。
 - **权限硬锁与续跑防提权**：`-TaskKind plan|review` 启动前拒绝任何写权限参数；跨 `$RunDir` 续跑若无法从本地状态或 `rollout` 还原原权限，直接报 `unknown_resume_mode` 退出，绝不静默落回 `--yolo`。
 - **脏工作区首轮基线保护**：`-CaptureBaseline` 在首次运行时记录 `HEAD`、`status`、`diff` 与 `diff --cached`，复用 `$RunDir` 开新会话（如遇 `active_writer`）时自动保留首轮基线不覆盖。
-- **实时可观测与桌面直达**：无缓冲写入 `*.events.jsonl` 与 `*.status.json`，支持通过 [scripts/wait-desktop-link.ps1](./scripts/wait-desktop-link.ps1) 快速拿到 `codex://threads/<id>` 链接，并自动将新派单登记到 Codex Desktop 的「Codex 派单」分区。
+- **实时可观测与桌面直达**：流式写入 `*.events.jsonl`（含实时命令/回复增量与轮中纠偏事件）与 `*.status.json`，支持通过 [scripts/wait-desktop-link.ps1](./scripts/wait-desktop-link.ps1) 快速拿到 `codex://threads/<id>` 链接，并自动将新派单登记到 Codex Desktop 的「Codex 派单」分区。
 - **防过度审查与防过度防御闭环**：严审细则见 [references/review-rubric.md](./references/review-rubric.md)，既用「同类联查 + 棘轮拦截」治改不全与复发坑，也要求主控在反向审查时过滤掉无可达路径的假想防御建议。
 
 ---
@@ -127,7 +130,7 @@ pwsh -NoProfile -File "<skill-dir>\scripts\run-codex.ps1" `
 
 ```text
 codex-loop/
-├── SKILL.md                             # 主控与执行端协作流程、角色分流与三种模式说明
+├── SKILL.md                             # 主控与执行端协作流程、实时纠偏与并发 2/worktree 协议
 ├── README.md                            # 开源安装、同步与使用指南
 ├── agents/
 │   └── openai.yaml                      # Codex 侧技能元信息（关闭隐式自动触发）
@@ -135,9 +138,17 @@ codex-loop/
 │   ├── codex-handoff.schema.json        # Codex 结构化回执 JSON Schema
 │   └── review-rubric.md                 # 严审红线、返工分级、反向审查过滤与打回模板
 └── scripts/
-    ├── run-codex.ps1                    # 核心封装脚本（派单、续跑、基线、校验、清理）
+    ├── run-codex.ps1                    # 核心封装脚本（默认 app-server 引擎、exec 回退、双槽限流、Job Object）
+    ├── steer-codex.ps1                  # 运行中实时纠偏（turn/steer）与打断（turn/interrupt）入口
+    ├── worktree-codex.ps1               # 同仓双写自动 git worktree 准备、巡检、安全集成与清理
     ├── wait-desktop-link.ps1            # 后台派单时短等桌面直达链接
-    └── add-sidebar-thread.ps1           # 通过 Codex App Server 设置标题并登记侧栏分区
+    ├── add-sidebar-thread.ps1           # exec 回退引擎使用的桌面侧栏分区登记助手
+    └── lib/
+        ├── app-server-runner.mjs        # 私有 app-server stdio 客户端、流式事件投影与 Named Pipe 控制服务
+        ├── control-client.mjs           # Named Pipe 认证控制客户端与状态轮询
+        ├── slots.mjs                    # 跨进程并发槽位表与崩溃进程树回收
+        ├── schema-validate.mjs          # 零依赖完整 JSON Schema 与三态业务校验
+        └── worktree.mjs                 # Git worktree 生命周期、脏仓门禁与二进制安全补丁集成
 ```
 
 ---

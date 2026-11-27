@@ -27,12 +27,29 @@ param(
 
     [string]$RunDir,
 
+    [ValidateSet('app-server', 'exec')]
+    [string]$Engine = 'app-server',
+
+    [ValidateRange(1, 2)]
+    [int]$MaxConcurrency = 2,
+
+    [string]$BatchId,
+
+    [string]$SubtaskId,
+
+    [string]$WorktreePath,
+
     [switch]$CaptureBaseline,
     [switch]$ReportStartup
 )
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
+
+$TaskKind = $TaskKind.ToLowerInvariant()
+$Mode = $Mode.ToLowerInvariant()
+$Engine = $Engine.ToLowerInvariant()
+if ($ReasoningEffort) { $ReasoningEffort = $ReasoningEffort.ToLowerInvariant() }
 
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = $utf8NoBom
@@ -164,6 +181,65 @@ function Write-FileAtomic([string]$Path, [string]$Content) {
     }
 }
 
+function Get-ObjProp($Target, [string]$Name) {
+    if ($null -eq $Target) { return @{ Found = $false; Value = $null } }
+    if ($Target -is [System.Collections.IDictionary]) {
+        if ($Target.Contains($Name)) { return @{ Found = $true; Value = $Target[$Name] } }
+        return @{ Found = $false; Value = $null }
+    }
+    $prop = $Target.PSObject.Properties[$Name]
+    if ($null -ne $prop) { return @{ Found = $true; Value = $prop.Value } }
+    return @{ Found = $false; Value = $null }
+}
+
+function Resolve-MergedField($Obj, $Existing, [string]$Name) {
+    $cur = Get-ObjProp $Obj $Name
+    if ($cur.Found) { return $cur.Value }
+    $prev = Get-ObjProp $Existing $Name
+    if ($prev.Found) { return $prev.Value }
+    return $null
+}
+
+function Find-RunIndexSession([string]$Id) {
+    if (-not $Id -or -not (Test-Path -LiteralPath $runIndexFile -PathType Leaf)) { return $null }
+    $needle = $Id.ToLowerInvariant()
+    try {
+        $raw = [System.IO.File]::ReadAllText($runIndexFile, $utf8NoBom)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        $arr = @($raw | ConvertFrom-Json -ErrorAction Stop)
+        foreach ($it in $arr) {
+            if ($null -eq $it) { continue }
+            if ($it.sessions) {
+                $sessList = @($it.sessions)
+                foreach ($s in $sessList) {
+                    if ($s -and $s.session_id -and "$($s.session_id)".ToLowerInvariant() -eq $needle) {
+                        $wtProp = Get-ObjProp $s 'worktree_path'
+                        $ewdProp = Get-ObjProp $s 'effective_work_dir'
+                        # Only inherit top-level worktree_path for legacy single-session index entries lacking per-session fields.
+                        $resolvedWt = if ($wtProp.Found) { $wtProp.Value } elseif ($sessList.Count -eq 1) { (Get-ObjProp $it 'worktree_path').Value } else { $null }
+                        $resolvedEwd = if ($ewdProp.Found) { $ewdProp.Value } elseif ($sessList.Count -eq 1) { (Get-ObjProp $it 'work_dir').Value } else { $null }
+                        return [ordered]@{
+                            session_id         = $needle
+                            worktree_path      = $resolvedWt
+                            effective_work_dir = $resolvedEwd
+                            run_dir            = $it.run_dir
+                        }
+                    }
+                }
+            }
+            if ($it.session_id -and "$($it.session_id)".ToLowerInvariant() -eq $needle) {
+                return [ordered]@{
+                    session_id         = $needle
+                    worktree_path      = (Get-ObjProp $it 'worktree_path').Value
+                    effective_work_dir = (Get-ObjProp $it 'work_dir').Value
+                    run_dir            = $it.run_dir
+                }
+            }
+        }
+    } catch {}
+    return $null
+}
+
 function Update-RunIndex($Obj, [bool]$IsFinal = $false) {
     # Decouple from standalone/non-AGY shells: only write AGY viewer index when invoked under Antigravity.
     if (-not $env:ANTIGRAVITY_APP_DATA_DIR -and -not $env:ANTIGRAVITY_CONVERSATION_ID) {
@@ -226,15 +302,21 @@ function Update-RunIndex($Obj, [bool]$IsFinal = $false) {
             foreach ($s in $prevSessions) {
                 if (-not $s -or -not $s.session_id) { continue }
                 $sk = "$($s.session_id)".ToLowerInvariant()
+                $prevWtProp = Get-ObjProp $s 'worktree_path'
+                $prevEwdProp = Get-ObjProp $s 'effective_work_dir'
                 $sessionMap[$sk] = [ordered]@{
-                    session_id     = $sk
-                    desktop_url    = if ($s.desktop_url) { $s.desktop_url } else { "codex://threads/$sk" }
-                    native_session = $s.native_session
+                    session_id         = $sk
+                    desktop_url        = if ($s.desktop_url) { $s.desktop_url } else { "codex://threads/$sk" }
+                    native_session     = $s.native_session
+                    worktree_path      = if ($prevWtProp.Found) { $prevWtProp.Value } else { $null }
+                    effective_work_dir = if ($prevEwdProp.Found) { $prevEwdProp.Value } else { $null }
                 }
             }
         }
 
-        $isConfirmedSession = $Obj.session_id -and ($Obj.error_kind -ne 'invalid_session') -and (
+        $confirmedProp = Get-ObjProp $Obj 'session_confirmed'
+        $explicitUnconfirmed = $confirmedProp.Found -and ($confirmedProp.Value -eq $false)
+        $isConfirmedSession = (-not $explicitUnconfirmed) -and $Obj.session_id -and ($Obj.error_kind -ne 'invalid_session') -and (
             $Obj.desktop_url -or $Obj.native_session -or $Obj.sidebar_registered -or $Obj.state -eq 'finished'
         )
         if ($isConfirmedSession) {
@@ -242,9 +324,11 @@ function Update-RunIndex($Obj, [bool]$IsFinal = $false) {
             $prevRec = if ($sessionMap.Contains($sk)) { $sessionMap[$sk] } else { $null }
             if ($sessionMap.Contains($sk)) { $sessionMap.Remove($sk) }
             $sessionMap[$sk] = [ordered]@{
-                session_id     = $sk
-                desktop_url    = if ($Obj.desktop_url) { $Obj.desktop_url } elseif ($prevRec -and $prevRec.desktop_url) { $prevRec.desktop_url } else { "codex://threads/$sk" }
-                native_session = if ($Obj.native_session) { $Obj.native_session } elseif ($prevRec) { $prevRec.native_session } else { $null }
+                session_id         = $sk
+                desktop_url        = if ($Obj.desktop_url) { $Obj.desktop_url } elseif ($prevRec -and $prevRec.desktop_url) { $prevRec.desktop_url } else { "codex://threads/$sk" }
+                native_session     = if ($Obj.native_session) { $Obj.native_session } elseif ($prevRec) { $prevRec.native_session } else { $null }
+                worktree_path      = Resolve-MergedField $Obj $prevRec 'worktree_path'
+                effective_work_dir = Resolve-MergedField $Obj $prevRec 'effective_work_dir'
             }
         }
 
@@ -262,6 +346,7 @@ function Update-RunIndex($Obj, [bool]$IsFinal = $false) {
         $entry = [ordered]@{
             run_dir            = $Obj.run_dir
             work_dir           = $Obj.work_dir
+            worktree_path      = Resolve-MergedField $Obj $existing 'worktree_path'
             conversation_id    = if ($Obj.conversation_id) { $Obj.conversation_id } elseif ($existing) { $existing.conversation_id } else { $null }
             session_id         = if ($latestSession) { $latestSession.session_id } else { $null }
             desktop_url        = if ($latestSession) { $latestSession.desktop_url } else { $null }
@@ -269,6 +354,9 @@ function Update-RunIndex($Obj, [bool]$IsFinal = $false) {
             sessions           = $sessionsList
             title              = $title
             task_kind          = $Obj.task_kind
+            engine             = Resolve-MergedField $Obj $existing 'engine'
+            batch_id           = Resolve-MergedField $Obj $existing 'batch_id'
+            subtask_id         = Resolve-MergedField $Obj $existing 'subtask_id'
             state              = $Obj.state
             started_at         = if ($existing -and $existing.started_at) { $existing.started_at } else { $Obj.started_at }
             updated_at         = (Get-Date).ToString('o')
@@ -320,7 +408,8 @@ try {
     New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
     $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
     $turnPrefix = if ($isResume) { 'resume' } else { 'initial' }
-    $turnTag = "$turnPrefix-$(Get-Date -Format 'HHmmss-fff')-$([Guid]::NewGuid().ToString('N').Substring(0, 4))"
+    $attemptUuid = [Guid]::NewGuid().ToString('N')
+    $turnTag = "$turnPrefix-$(Get-Date -Format 'HHmmss-fff')-$($attemptUuid.Substring(0, 8))"
     $promptOutFile = Join-Path $RunDir "$turnTag.prompt.txt"
     [System.IO.File]::WriteAllText($promptOutFile, $promptText, $utf8NoBom)
     $eventsFile = Join-Path $RunDir "$turnTag.events.jsonl"
@@ -475,13 +564,23 @@ function Read-EffectiveFromRollout([string]$Path) {
 
 function Find-PreviousSessionStatus([string]$Dir, [string]$Id) {
     if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return $null }
+    $preflightErrors = @(
+        'invalid_session', 'missing_worktree', 'worktree_binding_mismatch',
+        'invalid_arguments', 'unknown_resume_mode', 'slots_full',
+        'duplicate_run_dir', 'duplicate_attempt_id', 'active_writer',
+        'worktree_in_use', 'worktree_busy', 'job_object_failed'
+    )
     $files = Get-ChildItem -LiteralPath $Dir -File -Filter '*.status.json' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTimeUtc -Descending
     foreach ($f in $files) {
         if ($f.FullName -eq $statusFile) { continue }
         try {
             $obj = [System.IO.File]::ReadAllText($f.FullName, $utf8NoBom) | ConvertFrom-Json -ErrorAction Stop
-            if ($obj.session_id -eq $Id) { return $obj }
+            if ($obj.session_id -ne $Id) { continue }
+            $confProp = Get-ObjProp $obj 'session_confirmed'
+            if ($confProp.Found -and ($confProp.Value -eq $false)) { continue }
+            if ($obj.error_kind -and ($preflightErrors -contains "$($obj.error_kind)")) { continue }
+            return $obj
         } catch {}
     }
     return $null
@@ -534,21 +633,213 @@ function Register-DesktopThread {
 
 $launch = Resolve-CodexLaunch
 $cliVersion = Get-CodexCliVersion $launch
+$attemptId = "$turnPrefix-$attemptUuid"
 
-$isGitRepo = $false
-Push-Location -LiteralPath $resolvedWorkDir
-try {
-    $gitCheck = git rev-parse --is-inside-work-tree 2>$null
-    if ($LASTEXITCODE -eq 0 -and "$gitCheck".Trim() -eq 'true') { $isGitRepo = $true }
-} catch {
-    $isGitRepo = $false
-} finally {
-    Pop-Location
+function Resolve-NodeLaunch {
+    $nodeCmd = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($nodeCmd) { return @{ FilePath = $nodeCmd.Source; Env = @{} } }
+    $agyCmd = Join-Path $env:APPDATA 'Antigravity\bin\agy-node.cmd'
+    if ($env:APPDATA -and (Test-Path -LiteralPath $agyCmd -PathType Leaf)) {
+        $m = Select-String -LiteralPath $agyCmd -Pattern '"([^"]+Antigravity\.exe)"' | Select-Object -First 1
+        if ($m -and (Test-Path -LiteralPath $m.Matches[0].Groups[1].Value -PathType Leaf)) {
+            return @{ FilePath = $m.Matches[0].Groups[1].Value; Env = @{ ELECTRON_RUN_AS_NODE = '1' } }
+        }
+    }
+    throw 'Unable to locate node.exe or Antigravity Electron Node runtime.'
 }
+
+function Initialize-JobObjectType {
+    if ('CodexLoopJobHelper' -as [type]) { return $true }
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class CodexLoopJobHelper {
+    private const int JobObjectExtendedLimitInformation = 9;
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr hJob, int infoType, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    public static IntPtr CreateKillOnCloseJob() {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) return IntPtr.Zero;
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        int len = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+        IntPtr ptr = Marshal.AllocHGlobal(len);
+        try {
+            Marshal.StructureToPtr(info, ptr, false);
+            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ptr, (uint)len)) {
+                CloseHandle(job);
+                return IntPtr.Zero;
+            }
+            return job;
+        } finally {
+            Marshal.FreeHGlobal(ptr);
+        }
+    }
+
+    public static bool Assign(IntPtr job, IntPtr procHandle) {
+        if (job == IntPtr.Zero || procHandle == IntPtr.Zero) return false;
+        return AssignProcessToJobObject(job, procHandle);
+    }
+
+    public static void Close(IntPtr job) {
+        if (job != IntPtr.Zero) CloseHandle(job);
+    }
+}
+'@ -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-SlotsCommand([hashtable]$NodeLaunch, [string]$Command, [hashtable]$Payload) {
+    $slotsScript = Join-Path $PSScriptRoot 'lib\slots.mjs'
+    $jsonIn = $Payload | ConvertTo-Json -Compress -Depth 8
+    $psi = [Diagnostics.ProcessStartInfo]::new($NodeLaunch.FilePath)
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardInputEncoding = $utf8NoBom
+    $psi.StandardOutputEncoding = $utf8NoBom
+    foreach ($kv in $NodeLaunch.Env.GetEnumerator()) { $psi.Environment[$kv.Key] = $kv.Value }
+    $psi.ArgumentList.Add($slotsScript)
+    $psi.ArgumentList.Add($Command)
+    $p = [Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Write($jsonIn)
+    $p.StandardInput.Close()
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $p.WaitForExit(15000) | Out-Null
+    $text = $outTask.GetAwaiter().GetResult().Trim()
+    if (-not $text) { return @{ ok = $false; error_kind = 'slots_error'; message = 'Empty slots response.' } }
+    return ($text | ConvertFrom-Json -AsHashtable)
+}
+
+function Invoke-ValidateHandoff([hashtable]$NodeLaunch, [string]$HandoffPath, [string]$SchemaPath, [string]$Kind) {
+    $validatorScript = Join-Path $PSScriptRoot 'lib\schema-validate.mjs'
+    $psi = [Diagnostics.ProcessStartInfo]::new($NodeLaunch.FilePath)
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = $utf8NoBom
+    foreach ($kv in $NodeLaunch.Env.GetEnumerator()) { $psi.Environment[$kv.Key] = $kv.Value }
+    $psi.ArgumentList.Add($validatorScript)
+    $psi.ArgumentList.Add($HandoffPath)
+    $psi.ArgumentList.Add($SchemaPath)
+    $psi.ArgumentList.Add($Kind)
+    $p = [Diagnostics.Process]::Start($psi)
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $p.WaitForExit(15000) | Out-Null
+    $text = $outTask.GetAwaiter().GetResult().Trim()
+    if (-not $text) { return @{ valid = $false; errors = @('Empty schema validator response.') } }
+    return ($text | ConvertFrom-Json -AsHashtable)
+}
+
+function Test-IsGitWorkTree([string]$Dir) {
+    Push-Location -LiteralPath $Dir
+    try {
+        $gitCheck = git rev-parse --is-inside-work-tree 2>$null
+        return ($LASTEXITCODE -eq 0 -and "$gitCheck".Trim() -eq 'true')
+    } catch {
+        return $false
+    } finally {
+        Pop-Location
+    }
+}
+
+function Get-GitWorktreeRoot([string]$Dir) {
+    Push-Location -LiteralPath $Dir
+    try {
+        $top = git --no-optional-locks rev-parse --show-toplevel 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$top")) { return $null }
+        $gd = git --no-optional-locks rev-parse --git-dir 2>$null
+        $gcd = git --no-optional-locks rev-parse --git-common-dir 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$gd") -or [string]::IsNullOrWhiteSpace("$gcd")) { return $null }
+        $absGd = [System.IO.Path]::GetFullPath((Join-Path $Dir "$gd".Trim())).TrimEnd('\', '/')
+        $absGcd = [System.IO.Path]::GetFullPath((Join-Path $Dir "$gcd".Trim())).TrimEnd('\', '/')
+        if ($absGd.Equals($absGcd, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        return (Resolve-Path -LiteralPath "$top".Trim()).Path
+    } catch {
+        return $null
+    } finally {
+        Pop-Location
+    }
+}
+
+function Get-NormalizedDirPath([string]$Dir) {
+    if ([string]::IsNullOrWhiteSpace($Dir)) { return '' }
+    try {
+        return [System.IO.Path]::GetFullPath($Dir).TrimEnd('\', '/').ToLowerInvariant()
+    } catch {
+        return $Dir.Trim().TrimEnd('\', '/').ToLowerInvariant()
+    }
+}
+
+$resolvedWorktreePath = if (-not [string]::IsNullOrWhiteSpace($WorktreePath)) {
+    (Resolve-Path -LiteralPath $WorktreePath).Path
+} else {
+    $null
+}
+$effectiveWorkDir = if ($resolvedWorktreePath) { $resolvedWorktreePath } else { $resolvedWorkDir }
+$isGitRepo = Test-IsGitWorkTree $effectiveWorkDir
 
 $status = [ordered]@{
     state                = 'running'
     exit_code            = $null
+    engine               = $Engine
+    attempt_id           = $attemptId
+    batch_id             = if ($BatchId) { $BatchId } else { $null }
+    subtask_id           = if ($SubtaskId) { $SubtaskId } else { $null }
+    worktree_path        = $resolvedWorktreePath
     mode                 = if ($isResume) { 'resume' } else { 'exec' }
     task_kind            = $TaskKind
     requested_mode       = $Mode
@@ -556,7 +847,10 @@ $status = [ordered]@{
     requested_effort     = if ($ReasoningEffort) { $ReasoningEffort } else { $null }
     requested_model      = if ($Model) { $Model } else { $null }
     requested_tier       = if ($ServiceTier) { $ServiceTier } else { $null }
-    session_id           = if ($isResume) { $SessionId } else { $null }
+    session_confirmed    = $false
+    attempted_session_id = if ($isResume) { $SessionId } else { $null }
+    session_id           = $null
+    active_turn_id       = $null
     desktop_url          = $null
     sidebar_registered   = $false
     sidebar_title        = $null
@@ -569,6 +863,7 @@ $status = [ordered]@{
     started_at           = (Get-Date).ToString('o')
     finished_at          = $null
     work_dir             = $resolvedWorkDir
+    effective_work_dir   = $effectiveWorkDir
     is_git_repo          = $isGitRepo
     conversation_id      = $agConversationId
     run_dir              = $RunDir
@@ -593,22 +888,34 @@ $status = [ordered]@{
 
 $threadStarted = $false
 $rolloutFile = $null
+$initialNativeSession = $null
+$prevStatus = $null
+$prevEff = $null
 # Pre-validate resume session existence: Codex silently spawns a blank session for missing IDs.
 if ($isResume) {
     $rolloutFile = Find-CodexSessionFile $SessionId
     if (-not $rolloutFile) {
         Exit-PreflightFailure 'invalid_session' "Resume session not found or invalid UUID: $SessionId (checked $codexHome\sessions and archived_sessions); Codex was not started."
     }
-    $status.native_session = Get-PersistedRolloutPath $rolloutFile
+    $initialNativeSession = Get-PersistedRolloutPath $rolloutFile
 
-    # Inherit previous TaskKind, Mode, and overrides on resume unless explicitly specified.
+    # Inherit previous TaskKind, Mode, Engine, Worktree, and overrides on resume unless explicitly specified.
     $prevStatus = Find-PreviousSessionStatus $RunDir $SessionId
     if ($prevStatus) {
         $status.sidebar_registered = [bool]$prevStatus.sidebar_registered
         $status.sidebar_title = $prevStatus.sidebar_title
+        if (-not $PSBoundParameters.ContainsKey('Engine') -and $prevStatus.PSObject.Properties['engine'] -and $prevStatus.engine) {
+            $Engine = "$($prevStatus.engine)".ToLowerInvariant()
+        }
+        if (-not $PSBoundParameters.ContainsKey('BatchId') -and $prevStatus.PSObject.Properties['batch_id'] -and $prevStatus.batch_id) {
+            $BatchId = "$($prevStatus.batch_id)"
+        }
+        if (-not $PSBoundParameters.ContainsKey('SubtaskId') -and $prevStatus.PSObject.Properties['subtask_id'] -and $prevStatus.subtask_id) {
+            $SubtaskId = "$($prevStatus.subtask_id)"
+        }
     }
     if (-not $taskKindExplicit -and $prevStatus -and $prevStatus.task_kind) {
-        $TaskKind = "$($prevStatus.task_kind)"
+        $TaskKind = "$($prevStatus.task_kind)".ToLowerInvariant()
     }
     $status.task_kind = $TaskKind
 
@@ -620,7 +927,7 @@ if ($isResume) {
         $Mode = 'readonly'
     } elseif (-not $modeExplicit) {
         if ($prevStatus -and $prevStatus.requested_mode) {
-            $Mode = "$($prevStatus.requested_mode)"
+            $Mode = "$($prevStatus.requested_mode)".ToLowerInvariant()
         } else {
             $prevEff = Read-EffectiveFromRollout $rolloutFile.FullName
             if ($prevEff.sandbox -eq 'read-only') {
@@ -637,6 +944,41 @@ if ($isResume) {
             }
         }
     }
+    $status.requested_mode = $Mode
+
+    # Validate / inherit worktree binding AFTER TaskKind & Mode are resolved so preflight failures never record elevated defaults.
+    if (-not $PSBoundParameters.ContainsKey('WorktreePath')) {
+        if ($prevStatus -and $prevStatus.PSObject.Properties['worktree_path'] -and -not [string]::IsNullOrWhiteSpace("$($prevStatus.worktree_path)")) {
+            $prevWt = "$($prevStatus.worktree_path)"
+            if (-not (Test-Path -LiteralPath $prevWt -PathType Container)) {
+                Exit-PreflightFailure 'missing_worktree' "Session $SessionId was bound to worktree '$prevWt', which no longer exists. Pass -WorktreePath explicitly or start a new session."
+            }
+            $resolvedWorktreePath = (Resolve-Path -LiteralPath $prevWt).Path
+            $effectiveWorkDir = $resolvedWorktreePath
+            $isGitRepo = Test-IsGitWorkTree $effectiveWorkDir
+        } elseif (-not $prevStatus) {
+            $idxEntry = Find-RunIndexSession $SessionId
+            $idxWtProp = Get-ObjProp $idxEntry 'worktree_path'
+            if ($idxWtProp.Found -and -not [string]::IsNullOrWhiteSpace("$($idxWtProp.Value)")) {
+                $idxWt = "$($idxWtProp.Value)"
+                if (-not (Test-Path -LiteralPath $idxWt -PathType Container)) {
+                    Exit-PreflightFailure 'missing_worktree' "Session $SessionId was previously bound to worktree '$idxWt' (from runs index), which no longer exists. Pass -WorktreePath explicitly or start a new session."
+                }
+                $resolvedWorktreePath = (Resolve-Path -LiteralPath $idxWt).Path
+                $effectiveWorkDir = $resolvedWorktreePath
+                $isGitRepo = Test-IsGitWorkTree $effectiveWorkDir
+            }
+        }
+    }
+
+    # Prevent cross-RunDir write resumes from silently landing in a mismatched checkout even when runs.json had an entry.
+    if (-not $prevStatus -and -not $PSBoundParameters.ContainsKey('WorktreePath') -and $TaskKind -eq 'implement' -and $Mode -ne 'readonly') {
+        if ($null -eq $prevEff) { $prevEff = Read-EffectiveFromRollout $rolloutFile.FullName }
+        if ($prevEff -and $prevEff.workdir -and (Get-NormalizedDirPath $prevEff.workdir) -ne (Get-NormalizedDirPath $effectiveWorkDir)) {
+            Exit-PreflightFailure 'worktree_binding_mismatch' "Cross-RunDir write resume for session $SessionId previously ran in '$($prevEff.workdir)', which differs from target directory '$effectiveWorkDir'. Pass -WorktreePath explicitly (or matching -WorkDir) to avoid writing to the wrong checkout."
+        }
+    }
+
     if (-not $PSBoundParameters.ContainsKey('AddDir') -and $prevStatus -and $prevStatus.requested_add_dir) {
         $prevDirs = @($prevStatus.requested_add_dir | Where-Object { -not [string]::IsNullOrWhiteSpace("$_") })
         if ($prevDirs.Count -gt 0) { $AddDir = $prevDirs }
@@ -645,7 +987,7 @@ if ($isResume) {
         $Model = "$($prevStatus.requested_model)"
     }
     if (-not $PSBoundParameters.ContainsKey('ReasoningEffort') -and $prevStatus -and $prevStatus.requested_effort) {
-        $ReasoningEffort = "$($prevStatus.requested_effort)"
+        $ReasoningEffort = "$($prevStatus.requested_effort)".ToLowerInvariant()
     }
     if (-not $PSBoundParameters.ContainsKey('ServiceTier') -and $prevStatus -and $prevStatus.requested_tier) {
         $ServiceTier = "$($prevStatus.requested_tier)"
@@ -660,6 +1002,12 @@ if ($isResume) {
     }
     $Mode = 'readonly'
 }
+$status.engine = $Engine
+$status.batch_id = if ($BatchId) { $BatchId } else { $null }
+$status.subtask_id = if ($SubtaskId) { $SubtaskId } else { $null }
+$status.worktree_path = $resolvedWorktreePath
+$status.effective_work_dir = $effectiveWorkDir
+$status.is_git_repo = $isGitRepo
 $status.task_kind = $TaskKind
 $status.requested_mode = $Mode
 
@@ -669,322 +1017,573 @@ if ($AddDir -and $AddDir.Count -gt 0) {
 }
 $status.requested_add_dir = $resolvedAddDirs
 
-if ($CaptureBaseline) {
-    Push-Location -LiteralPath $resolvedWorkDir
-    try {
-        if ($isGitRepo) {
-            $status.baseline_head_file = Join-Path $RunDir 'baseline.head.txt'
-            $status.baseline_status_file = Join-Path $RunDir 'baseline.status.txt'
-            $status.baseline_diff_file = Join-Path $RunDir 'baseline.diff.patch'
-            $status.baseline_cached_file = Join-Path $RunDir 'baseline.cached.patch'
-            # Preserve the first-round baseline when reusing RunDir (e.g. opening a new session after active_writer).
-            $hasExistingBaseline = (Test-Path -LiteralPath $status.baseline_head_file -PathType Leaf) -and
-                (Test-Path -LiteralPath $status.baseline_status_file -PathType Leaf) -and
-                (Test-Path -LiteralPath $status.baseline_diff_file -PathType Leaf) -and
-                (Test-Path -LiteralPath $status.baseline_cached_file -PathType Leaf)
-            if (-not $hasExistingBaseline) {
-                $headSha = git rev-parse HEAD 2>$null
-                $headOut = if ($LASTEXITCODE -eq 0 -and $headSha) { "$headSha".Trim() } else { '' }
-                [System.IO.File]::WriteAllText($status.baseline_head_file, $headOut, $utf8NoBom)
-                $statusLines = git status --porcelain 2>$null
-                [System.IO.File]::WriteAllLines($status.baseline_status_file, @($statusLines), $utf8NoBom)
-                $diffLines = git diff 2>$null
-                [System.IO.File]::WriteAllLines($status.baseline_diff_file, @($diffLines), $utf8NoBom)
-                $cachedLines = git diff --cached 2>$null
-                [System.IO.File]::WriteAllLines($status.baseline_cached_file, @($cachedLines), $utf8NoBom)
-            }
-        } else {
-            $status.baseline_status_file = Join-Path $RunDir 'baseline.files.txt'
-            if (-not (Test-Path -LiteralPath $status.baseline_status_file -PathType Leaf)) {
-                $fileLines = Get-ChildItem -LiteralPath $resolvedWorkDir -Recurse -File -ErrorAction SilentlyContinue |
-                    ForEach-Object { "$($_.LastWriteTimeUtc.ToString('o'))|$($_.Length)|$($_.FullName)" }
-                [System.IO.File]::WriteAllLines($status.baseline_status_file, @($fileLines), $utf8NoBom)
-            }
-        }
-    } finally {
-        Pop-Location
-    }
+$nodeExe = Resolve-NodeLaunch
+$hasJobHelper = Initialize-JobObjectType
+$runnerStartedMs = try { ([datetimeoffset](Get-Process -Id $PID).StartTime).ToUnixTimeMilliseconds() } catch { $null }
+
+# Detect linked Git worktree root even when caller passed -WorkDir <worktree> (or a subdir) without -WorktreePath.
+$slotWorktreePath = if ($resolvedWorktreePath) {
+    $resolvedWorktreePath
+} elseif ($isGitRepo) {
+    Get-GitWorktreeRoot $effectiveWorkDir
+} else {
+    $null
 }
 
-$codexArgs = [System.Collections.Generic.List[string]]::new()
-foreach ($a in $launch.PrefixArgs) { $codexArgs.Add($a) }
-$codexArgs.Add('exec')
-
-# Parent-level exec flags (work for both new sessions and resume)
-if ($Mode -eq 'yolo') {
-    $codexArgs.Add('--yolo')
-} elseif ($Mode -eq 'auto' -and -not $isResume) {
-    $codexArgs.Add('--approve-for-me')
-} elseif ($Mode -eq 'workspace' -and -not $isResume) {
-    $codexArgs.Add('-s')
-    $codexArgs.Add('workspace-write')
-} elseif ($Mode -eq 'readonly' -and -not $isResume) {
-    $codexArgs.Add('-s')
-    $codexArgs.Add('read-only')
+# Acquire the cross-process concurrency slot ONCE BEFORE writing shared baseline files or branching by engine.
+$slotAcquireRes = Invoke-SlotsCommand $nodeExe 'acquire' @{
+    attempt_id        = $attemptId
+    max_concurrency   = $MaxConcurrency
+    batch_id          = $status.batch_id
+    subtask_id        = $status.subtask_id
+    engine            = $Engine
+    task_kind         = $TaskKind
+    mode              = $Mode
+    title             = if ($status.sidebar_title) { $status.sidebar_title } else { Get-PromptTitle $promptText }
+    run_dir           = $RunDir
+    work_dir          = $resolvedWorkDir
+    worktree_path     = $slotWorktreePath
+    session_id        = if ($isResume) { $SessionId } else { $null }
+    runner_pid        = $PID
+    runner_started_ms = $runnerStartedMs
+    status_file       = $statusFile
+}
+if (-not $slotAcquireRes.ok) {
+    if ($slotAcquireRes.active_slots) { $status['active_slots'] = $slotAcquireRes.active_slots }
+    Exit-PreflightFailure ($slotAcquireRes.error_kind ?? 'slots_full') ($slotAcquireRes.message ?? 'Concurrency limit reached.')
 }
 
-$codexArgs.Add('-C')
-$codexArgs.Add($resolvedWorkDir)
-
-if (-not $isGitRepo) {
-    $codexArgs.Add('--skip-git-repo-check')
-}
-
-if (-not $isResume -and $resolvedAddDirs.Count -gt 0) {
-    foreach ($dir in $resolvedAddDirs) {
-        $codexArgs.Add('--add-dir')
-        $codexArgs.Add($dir)
-    }
-}
-
-if ($isResume) {
-    $codexArgs.Add('resume')
-    if ($Mode -eq 'workspace' -or $Mode -eq 'auto') {
-        $codexArgs.Add('-c')
-        $codexArgs.Add('sandbox_mode="workspace-write"')
-        if ($Mode -eq 'workspace') {
-            $codexArgs.Add('-c')
-            $codexArgs.Add('approval_policy="never"')
-        } else {
-            $codexArgs.Add('-c')
-            $codexArgs.Add('approval_policy="on-request"')
-            $codexArgs.Add('-c')
-            $codexArgs.Add('approvals_reviewer="auto_review"')
-        }
-        if ($resolvedAddDirs.Count -gt 0) {
-            $escapedDirs = $resolvedAddDirs | ForEach-Object {
-                $p = $_.Replace('\', '\\').Replace('"', '\"')
-                "`"$p`""
-            }
-            $codexArgs.Add('-c')
-            $codexArgs.Add("sandbox_workspace_write.writable_roots=[$($escapedDirs -join ',')]")
-        }
-    } elseif ($Mode -eq 'readonly') {
-        $codexArgs.Add('-c')
-        $codexArgs.Add('sandbox_mode="read-only"')
-        $codexArgs.Add('-c')
-        $codexArgs.Add('approval_policy="never"')
-    }
-} elseif ($Mode -eq 'workspace' -or $Mode -eq 'readonly') {
-    $codexArgs.Add('-c')
-    $codexArgs.Add('approval_policy="never"')
-}
-
-if (-not [string]::IsNullOrWhiteSpace($ReasoningEffort)) {
-    $codexArgs.Add('-c')
-    $codexArgs.Add("model_reasoning_effort=`"$ReasoningEffort`"")
-}
-$codexArgs.Add('-c')
-$codexArgs.Add('notify=[]')
-$codexArgs.Add('--disable')
-$codexArgs.Add('default_mode_request_user_input')
-
-if (-not [string]::IsNullOrWhiteSpace($Model)) {
-    $codexArgs.Add('-m')
-    $codexArgs.Add($Model)
-}
-
-if (-not [string]::IsNullOrWhiteSpace($ServiceTier)) {
-    $codexArgs.Add('-c')
-    $codexArgs.Add("service_tier=`"$ServiceTier`"")
-}
-
-$codexArgs.Add('--output-schema')
-$codexArgs.Add($schemaFile)
-$codexArgs.Add('--json')
-$codexArgs.Add('-o')
-$codexArgs.Add($handoffFile)
-
-if ($isResume) {
-    $codexArgs.Add($SessionId)
-}
-$codexArgs.Add('-')
-
-Save-Status $status | Out-Null
-
-$proc = $null
-$streams = @()
-$copyTasks = @()
-$waited = $false
+$slotAcquired = $true
+$scriptExitCode = 1
+$finalOutputJson = ''
 
 try {
-    $psi = [Diagnostics.ProcessStartInfo]::new($launch.FilePath)
-    $psi.WorkingDirectory = $resolvedWorkDir
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.StandardInputEncoding = $utf8NoBom
-    # Isolate child process group so finally cleans up the full process tree cleanly via taskkill /T.
-    $psi.CreateNewProcessGroup = $true
-    foreach ($arg in $codexArgs) { $psi.ArgumentList.Add($arg) }
-
-    $proc = [Diagnostics.Process]::Start($psi)
-    $status.cli_pid = $proc.Id
-    Save-Status $status | Out-Null
-
-    # Buffer size 1 flushes immediately so live progress logs are readable while running.
-    $streams = @(
-        [IO.FileStream]::new($eventsFile, 'Create', 'Write', 'ReadWrite', 1),
-        [IO.FileStream]::new($stderrFile, 'Create', 'Write', 'ReadWrite', 1)
-    )
-    $copyTasks = @(
-        $proc.StandardOutput.BaseStream.CopyToAsync($streams[0]),
-        $proc.StandardError.BaseStream.CopyToAsync($streams[1])
-    )
-
-    $proc.StandardInput.Write($promptText)
-    $proc.StandardInput.Close()
-
-    $watchStartup = $true
-    while (-not $proc.WaitForExit(($threadStarted ? 2000 : 250))) {
-        if (-not $watchStartup) { continue }
+    if ($CaptureBaseline) {
+        Push-Location -LiteralPath $effectiveWorkDir
         try {
-            if (-not $threadStarted) {
-                $head = Read-SharedText $eventsFile 65536
-                $m = [regex]::Match($head, '"type"\s*:\s*"thread\.started"[^}]*"thread_id"\s*:\s*"([0-9a-f-]+)"')
-                if (-not $m.Success) { continue }
-                $status.session_id = $m.Groups[1].Value
-                $threadStarted = $true
-                Save-Status $status | Out-Null
+            if ($isGitRepo) {
+                $status.baseline_head_file = Join-Path $RunDir 'baseline.head.txt'
+                $status.baseline_status_file = Join-Path $RunDir 'baseline.status.txt'
+                $status.baseline_diff_file = Join-Path $RunDir 'baseline.diff.patch'
+                $status.baseline_cached_file = Join-Path $RunDir 'baseline.cached.patch'
+                # Preserve the first-round baseline when reusing RunDir (e.g. opening a new session after active_writer).
+                $hasExistingBaseline = (Test-Path -LiteralPath $status.baseline_head_file -PathType Leaf) -and
+                    (Test-Path -LiteralPath $status.baseline_status_file -PathType Leaf) -and
+                    (Test-Path -LiteralPath $status.baseline_diff_file -PathType Leaf) -and
+                    (Test-Path -LiteralPath $status.baseline_cached_file -PathType Leaf)
+                if (-not $hasExistingBaseline) {
+                    $headSha = git rev-parse HEAD 2>$null
+                    $headOut = if ($LASTEXITCODE -eq 0 -and $headSha) { "$headSha".Trim() } else { '' }
+                    [System.IO.File]::WriteAllText($status.baseline_head_file, $headOut, $utf8NoBom)
+                    $statusLines = git status --porcelain 2>$null
+                    [System.IO.File]::WriteAllLines($status.baseline_status_file, @($statusLines), $utf8NoBom)
+                    $diffLines = git diff 2>$null
+                    [System.IO.File]::WriteAllLines($status.baseline_diff_file, @($diffLines), $utf8NoBom)
+                    $cachedLines = git diff --cached 2>$null
+                    [System.IO.File]::WriteAllLines($status.baseline_cached_file, @($cachedLines), $utf8NoBom)
+                }
+            } else {
+                $status.baseline_status_file = Join-Path $RunDir 'baseline.files.txt'
+                if (-not (Test-Path -LiteralPath $status.baseline_status_file -PathType Leaf)) {
+                    $fileLines = Get-ChildItem -LiteralPath $effectiveWorkDir -Recurse -File -ErrorAction SilentlyContinue |
+                        ForEach-Object { "$($_.LastWriteTimeUtc.ToString('o'))|$($_.Length)|$($_.FullName)" }
+                    [System.IO.File]::WriteAllLines($status.baseline_status_file, @($fileLines), $utf8NoBom)
+                }
             }
-            if (-not $status.native_session) {
-                $rolloutFile ??= Find-CodexSessionFile $status.session_id
-                $status.native_session = Get-PersistedRolloutPath $rolloutFile
+        } finally {
+            Pop-Location
+        }
+    }
+
+    if ($Engine -eq 'app-server') {
+        # Keep session_id / native_session unconfirmed until app-server thread/start or thread/resume actually succeeds.
+        $status['session_confirmed'] = $false
+        $status['attempted_session_id'] = if ($isResume) { $SessionId } else { $null }
+        $status.session_id = $null
+        $status.native_session = $null
+
+        $runnerScript = Join-Path $PSScriptRoot 'lib\app-server-runner.mjs'
+        $runnerConfigFile = Join-Path $RunDir "$turnTag.runner-config.json"
+        $runnerCfg = [ordered]@{
+            attempt_id              = $attemptId
+            turn_tag                = $turnTag
+            wrapper_pid             = $PID
+            wrapper_started_ms      = $runnerStartedMs
+            slot_acquired_by_wrapper = $true
+            wait_stdin_go           = $true
+            max_concurrency         = $MaxConcurrency
+            batch_id                = $status.batch_id
+            subtask_id              = $status.subtask_id
+            worktree_path           = $resolvedWorktreePath
+            is_resume               = $isResume
+            session_id              = if ($isResume) { $SessionId } else { $null }
+            task_kind               = $TaskKind
+            requested_mode          = $Mode
+            requested_add_dir       = $resolvedAddDirs
+            requested_effort        = $status.requested_effort
+            requested_model         = $status.requested_model
+            requested_tier          = $status.requested_tier
+            prev_sidebar_registered = $status.sidebar_registered
+            prev_sidebar_title      = $status.sidebar_title
+            initial_native_session  = $initialNativeSession
+            cli_path                = $launch.FilePath
+            cli_prefix_args         = @($launch.PrefixArgs)
+            cli_version             = $cliVersion
+            codex_home              = $codexHome
+            schema_file             = $schemaFile
+            work_dir                = $resolvedWorkDir
+            is_git_repo             = $isGitRepo
+            conversation_id         = $agConversationId
+            run_dir                 = $RunDir
+            prompt_file             = $promptOutFile
+            source_prompt_file      = $sourcePromptFile
+            status_file             = $statusFile
+            handoff_file            = $handoffFile
+            events_file             = $eventsFile
+            stderr_file             = $stderrFile
+            baseline_head_file      = $status.baseline_head_file
+            baseline_status_file    = $status.baseline_status_file
+            baseline_diff_file      = $status.baseline_diff_file
+            baseline_cached_file    = $status.baseline_cached_file
+            started_at              = $status.started_at
+            report_startup          = [bool]$ReportStartup
+        }
+        Write-FileAtomic $runnerConfigFile ($runnerCfg | ConvertTo-Json -Depth 10)
+        Save-Status $status | Out-Null
+
+        $jobHandle = [IntPtr]::Zero
+        $nodeProc = $null
+        $nodeExitCode = 1
+        $runnerOut = ''
+        try {
+            if (-not $hasJobHelper) {
+                $status.error_kind = 'job_object_failed'
+                throw 'Failed to initialize Windows Job Object helper; refusing to run without crash-cleanup guarantee.'
             }
-            if ($status.native_session) {
-                Save-Status $status | Out-Null
-                if ($status.sidebar_registered -and $status.sidebar_title) {
-                    $watchStartup = $false
+            $jobHandle = [CodexLoopJobHelper]::CreateKillOnCloseJob()
+            if ($jobHandle -eq [IntPtr]::Zero) {
+                $status.error_kind = 'job_object_failed'
+                throw 'CreateKillOnCloseJob returned NULL; refusing to start child process without Job Object.'
+            }
+
+            $psi = [Diagnostics.ProcessStartInfo]::new($nodeExe.FilePath)
+            $psi.WorkingDirectory = $effectiveWorkDir
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardInputEncoding = $utf8NoBom
+            $psi.StandardOutputEncoding = $utf8NoBom
+            $psi.StandardErrorEncoding = $utf8NoBom
+            foreach ($kv in $nodeExe.Env.GetEnumerator()) { $psi.Environment[$kv.Key] = $kv.Value }
+            $psi.ArgumentList.Add($runnerScript)
+            $psi.ArgumentList.Add($runnerConfigFile)
+
+            $nodeProc = [Diagnostics.Process]::Start($psi)
+            $assigned = [CodexLoopJobHelper]::Assign($jobHandle, $nodeProc.Handle)
+            if (-not $assigned -and -not $nodeProc.HasExited) {
+                $status.error_kind = 'job_object_failed'
+                throw 'AssignProcessToJobObject failed for app-server runner; terminating child process.'
+            }
+            # Signal GO only AFTER the runner is safely inside the kill-on-close Job Object.
+            $nodeProc.StandardInput.WriteLine('GO')
+            $nodeProc.StandardInput.Close()
+
+            $stdoutTask = $nodeProc.StandardOutput.ReadToEndAsync()
+            while ($null -ne ($errLine = $nodeProc.StandardError.ReadLine())) {
+                [Console]::Error.WriteLine($errLine)
+                if ($errLine.StartsWith('CODEX_DESKTOP_URL=')) {
+                    try {
+                        $liveObj = [System.IO.File]::ReadAllText($statusFile, $utf8NoBom) | ConvertFrom-Json -ErrorAction Stop
+                        Update-RunIndex $liveObj $false
+                    } catch {}
+                }
+            }
+            $nodeProc.WaitForExit()
+            $nodeExitCode = $nodeProc.ExitCode
+            $runnerOut = $stdoutTask.GetAwaiter().GetResult().Trim()
+        } catch {
+            $status.state = 'failed'
+            $status.exit_code = 1
+            if (-not $status.error_kind) { $status.error_kind = 'runner_error' }
+            $status.errors = @($_.Exception.Message)
+            $status.finished_at = (Get-Date).ToString('o')
+            $runnerOut = Save-Status $status
+            $nodeExitCode = 1
+        } finally {
+            if ($nodeProc -and -not $nodeProc.HasExited) {
+                try {
+                    $killer = [Diagnostics.ProcessStartInfo]::new('taskkill.exe')
+                    foreach ($karg in @('/PID', "$($nodeProc.Id)", '/T', '/F')) { $killer.ArgumentList.Add($karg) }
+                    $killer.UseShellExecute = $false
+                    $killer.CreateNoWindow = $true
+                    $killer.RedirectStandardOutput = $true
+                    $killer.RedirectStandardError = $true
+                    [Diagnostics.Process]::Start($killer).WaitForExit(10000) | Out-Null
+                } catch {}
+            }
+            if ($jobHandle -ne [IntPtr]::Zero) {
+                [CodexLoopJobHelper]::Close($jobHandle)
+            }
+            if (Test-Path -LiteralPath $runnerConfigFile -PathType Leaf) {
+                try { Remove-Item -LiteralPath $runnerConfigFile -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            if (Test-Path -LiteralPath $statusFile -PathType Leaf) {
+                try {
+                    $finalObj = [System.IO.File]::ReadAllText($statusFile, $utf8NoBom) | ConvertFrom-Json -ErrorAction Stop
+                    if ($finalObj.state -eq 'running') {
+                        $finalObj.state = 'stopped'
+                        $finalObj.finished_at = (Get-Date).ToString('o')
+                        Write-FileAtomic $statusFile ($finalObj | ConvertTo-Json -Depth 12)
+                    }
+                    Update-RunIndex $finalObj $true
+                } catch {}
+            }
+        }
+
+        $finalOutputJson = if ($runnerOut) {
+            $runnerOut
+        } elseif (Test-Path -LiteralPath $statusFile -PathType Leaf) {
+            [System.IO.File]::ReadAllText($statusFile, $utf8NoBom)
+        } else {
+            ''
+        }
+        $scriptExitCode = $nodeExitCode
+    } else {
+        $codexArgs = [System.Collections.Generic.List[string]]::new()
+        foreach ($a in $launch.PrefixArgs) { $codexArgs.Add($a) }
+        $codexArgs.Add('exec')
+
+        # Parent-level exec flags (work for both new sessions and resume)
+        if ($Mode -eq 'yolo') {
+            $codexArgs.Add('--yolo')
+        } elseif ($Mode -eq 'auto' -and -not $isResume) {
+            $codexArgs.Add('--approve-for-me')
+        } elseif ($Mode -eq 'workspace' -and -not $isResume) {
+            $codexArgs.Add('-s')
+            $codexArgs.Add('workspace-write')
+        } elseif ($Mode -eq 'readonly' -and -not $isResume) {
+            $codexArgs.Add('-s')
+            $codexArgs.Add('read-only')
+        }
+
+        $codexArgs.Add('-C')
+        $codexArgs.Add($effectiveWorkDir)
+
+        if (-not $isGitRepo) {
+            $codexArgs.Add('--skip-git-repo-check')
+        }
+
+        if (-not $isResume -and $resolvedAddDirs.Count -gt 0) {
+            foreach ($dir in $resolvedAddDirs) {
+                $codexArgs.Add('--add-dir')
+                $codexArgs.Add($dir)
+            }
+        }
+
+        if ($isResume) {
+            $codexArgs.Add('resume')
+            if ($Mode -eq 'workspace' -or $Mode -eq 'auto') {
+                $codexArgs.Add('-c')
+                $codexArgs.Add('sandbox_mode="workspace-write"')
+                if ($Mode -eq 'workspace') {
+                    $codexArgs.Add('-c')
+                    $codexArgs.Add('approval_policy="never"')
+                } else {
+                    $codexArgs.Add('-c')
+                    $codexArgs.Add('approval_policy="on-request"')
+                    $codexArgs.Add('-c')
+                    $codexArgs.Add('approvals_reviewer="auto_review"')
+                }
+                if ($resolvedAddDirs.Count -gt 0) {
+                    $escapedDirs = $resolvedAddDirs | ForEach-Object {
+                        $p = $_.Replace('\', '\\').Replace('"', '\"')
+                        "`"$p`""
+                    }
+                    $codexArgs.Add('-c')
+                    $codexArgs.Add("sandbox_workspace_write.writable_roots=[$($escapedDirs -join ',')]")
+                }
+            } elseif ($Mode -eq 'readonly') {
+                $codexArgs.Add('-c')
+                $codexArgs.Add('sandbox_mode="read-only"')
+                $codexArgs.Add('-c')
+                $codexArgs.Add('approval_policy="never"')
+            }
+        } elseif ($Mode -eq 'workspace' -or $Mode -eq 'readonly') {
+            $codexArgs.Add('-c')
+            $codexArgs.Add('approval_policy="never"')
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ReasoningEffort)) {
+            $codexArgs.Add('-c')
+            $codexArgs.Add("model_reasoning_effort=`"$ReasoningEffort`"")
+        }
+        $codexArgs.Add('-c')
+        $codexArgs.Add('notify=[]')
+        $codexArgs.Add('--disable')
+        $codexArgs.Add('default_mode_request_user_input')
+
+        if (-not [string]::IsNullOrWhiteSpace($Model)) {
+            $codexArgs.Add('-m')
+            $codexArgs.Add($Model)
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ServiceTier)) {
+            $codexArgs.Add('-c')
+            $codexArgs.Add("service_tier=`"$ServiceTier`"")
+        }
+
+        $codexArgs.Add('--output-schema')
+        $codexArgs.Add($schemaFile)
+        $codexArgs.Add('--json')
+        $codexArgs.Add('-o')
+        $codexArgs.Add($handoffFile)
+
+        if ($isResume) {
+            $codexArgs.Add($SessionId)
+        }
+        $codexArgs.Add('-')
+
+        Save-Status $status | Out-Null
+
+        $jobHandle = [IntPtr]::Zero
+        $proc = $null
+        $streams = @()
+        $copyTasks = @()
+        $waited = $false
+        $execGoFile = $null
+
+        try {
+            if (-not $hasJobHelper) {
+                $status.error_kind = 'job_object_failed'
+                throw 'Failed to initialize Windows Job Object helper; refusing to run without crash-cleanup guarantee.'
+            }
+            $jobHandle = [CodexLoopJobHelper]::CreateKillOnCloseJob()
+            if ($jobHandle -eq [IntPtr]::Zero) {
+                $status.error_kind = 'job_object_failed'
+                throw 'CreateKillOnCloseJob returned NULL; refusing to start child process without Job Object.'
+            }
+
+            $psi = [Diagnostics.ProcessStartInfo]::new($launch.FilePath)
+            $psi.WorkingDirectory = $effectiveWorkDir
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardInputEncoding = $utf8NoBom
+            # Isolate child process group so finally cleans up the full process tree cleanly via taskkill /T.
+            $psi.CreateNewProcessGroup = $true
+            # When falling back to npm node.exe + codex.js, gate codex.js via --import until Job Object Assign completes.
+            if ($launch.PrefixArgs.Count -gt 0) {
+                $execGoFile = Join-Path $RunDir "$turnTag.exec-go"
+                $psi.Environment['CODEX_LOOP_EXEC_GO_FILE'] = $execGoFile
+                $gateJs = 'import fs from "node:fs";const f=process.env.CODEX_LOOP_EXEC_GO_FILE,d=Date.now()+10000;while(f&&!fs.existsSync(f)){if(Date.now()>d)process.exit(2);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);}'
+                $psi.ArgumentList.Add("--import=data:text/javascript,$([Uri]::EscapeDataString($gateJs))")
+            }
+            foreach ($arg in $codexArgs) { $psi.ArgumentList.Add($arg) }
+
+            $proc = [Diagnostics.Process]::Start($psi)
+            $assigned = [CodexLoopJobHelper]::Assign($jobHandle, $proc.Handle)
+            if (-not $assigned -and -not $proc.HasExited) {
+                $status.error_kind = 'job_object_failed'
+                throw 'AssignProcessToJobObject failed for codex exec; terminating child process before prompt delivery.'
+            }
+            if ($execGoFile) {
+                [System.IO.File]::WriteAllText($execGoFile, 'GO', $utf8NoBom)
+            }
+            $status.cli_pid = $proc.Id
+            $cliStartedMs = try { ([datetimeoffset]$proc.StartTime).ToUnixTimeMilliseconds() } catch { $null }
+            Save-Status $status | Out-Null
+            try { Invoke-SlotsCommand $nodeExe 'update' @{ attempt_id = $attemptId; patch = @{ cli_pid = $proc.Id; cli_started_ms = $cliStartedMs } } | Out-Null } catch {}
+
+            # Buffer size 1 flushes immediately so live progress logs are readable while running.
+            $streams = @(
+                [IO.FileStream]::new($eventsFile, 'Create', 'Write', 'ReadWrite', 1),
+                [IO.FileStream]::new($stderrFile, 'Create', 'Write', 'ReadWrite', 1)
+            )
+            $copyTasks = @(
+                $proc.StandardOutput.BaseStream.CopyToAsync($streams[0]),
+                $proc.StandardError.BaseStream.CopyToAsync($streams[1])
+            )
+
+            $proc.StandardInput.Write($promptText)
+            $proc.StandardInput.Close()
+
+            $watchStartup = $true
+            while (-not $proc.WaitForExit(($threadStarted ? 2000 : 250))) {
+                if (-not $watchStartup) { continue }
+                try {
+                    if (-not $threadStarted) {
+                        $head = Read-SharedText $eventsFile 65536
+                        $m = [regex]::Match($head, '"type"\s*:\s*"thread\.started"[^}]*"thread_id"\s*:\s*"([0-9a-f-]+)"')
+                        if (-not $m.Success) { continue }
+                        $status.session_id = $m.Groups[1].Value
+                        $status.session_confirmed = $true
+                        if ($isResume -and $initialNativeSession) { $status.native_session = $initialNativeSession }
+                        $threadStarted = $true
+                        Save-Status $status | Out-Null
+                        try { Invoke-SlotsCommand $nodeExe 'update' @{ attempt_id = $attemptId; patch = @{ session_id = $status.session_id } } | Out-Null } catch {}
+                    }
+                    if (-not $status.native_session) {
+                        $rolloutFile ??= Find-CodexSessionFile $status.session_id
+                        $status.native_session = Get-PersistedRolloutPath $rolloutFile
+                    }
+                    if ($status.native_session) {
+                        Save-Status $status | Out-Null
+                        if ($status.sidebar_registered -and $status.sidebar_title) {
+                            $watchStartup = $false
+                            continue
+                        }
+                        $watchStartup = -not (Register-DesktopThread)
+                        Save-Status $status | Out-Null
+                    }
+                } catch [IO.IOException] {
+                    # A live log or status file may be temporarily locked by its reader.
                     continue
                 }
-                $watchStartup = -not (Register-DesktopThread)
-                Save-Status $status | Out-Null
             }
-        } catch [IO.IOException] {
-            # A live log or status file may be temporarily locked by its reader.
-            continue
-        }
-    }
-    $proc.WaitForExit()
-    $waited = $true
-} catch {
-    $status.state = 'failed'
-    $status.errors = @($_.Exception.Message)
-} finally {
-    if ($proc -and -not $proc.HasExited) {
-        try {
-            $killer = [Diagnostics.ProcessStartInfo]::new('taskkill.exe')
-            foreach ($karg in @('/PID', "$($proc.Id)", '/T', '/F')) { $killer.ArgumentList.Add($karg) }
-            $killer.UseShellExecute = $false
-            $killer.CreateNoWindow = $true
-            $killer.RedirectStandardOutput = $true
-            $killer.RedirectStandardError = $true
-            [Diagnostics.Process]::Start($killer).WaitForExit(10000) | Out-Null
-            if (-not $proc.WaitForExit(10000)) {
-                $proc.Kill($true)
-                $proc.WaitForExit(10000) | Out-Null
+            $proc.WaitForExit()
+            $waited = $true
+        } catch {
+            $status.state = 'failed'
+            $status.errors = @($_.Exception.Message)
+        } finally {
+            if ($proc -and -not $proc.HasExited) {
+                try {
+                    $killer = [Diagnostics.ProcessStartInfo]::new('taskkill.exe')
+                    foreach ($karg in @('/PID', "$($proc.Id)", '/T', '/F')) { $killer.ArgumentList.Add($karg) }
+                    $killer.UseShellExecute = $false
+                    $killer.CreateNoWindow = $true
+                    $killer.RedirectStandardOutput = $true
+                    $killer.RedirectStandardError = $true
+                    [Diagnostics.Process]::Start($killer).WaitForExit(10000) | Out-Null
+                    if (-not $proc.WaitForExit(10000)) {
+                        $proc.Kill($true)
+                        $proc.WaitForExit(10000) | Out-Null
+                    }
+                } catch {}
             }
-        } catch {}
-    }
-    if ($copyTasks.Count -gt 0) {
-        try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$copyTasks, 10000) | Out-Null } catch {}
-    }
-    foreach ($s in $streams) { $s.Dispose() }
-
-    $status.exit_code = if ($proc -and $proc.HasExited) { $proc.ExitCode } else { 1 }
-    if (-not $waited -and $status.state -eq 'running') { $status.state = 'stopped' }
-
-    $errList = [System.Collections.Generic.List[string]]::new()
-    foreach ($e in $status.errors) { $errList.Add($e) }
-
-    if (Test-Path -LiteralPath $eventsFile -PathType Leaf) {
-        foreach ($line in Get-Content -LiteralPath $eventsFile -Encoding utf8) {
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            try { $ev = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            if ($ev.type -eq 'thread.started' -and $ev.thread_id) {
-                $status.session_id = $ev.thread_id
-                $threadStarted = $true
-            } elseif ($ev.type -eq 'turn.completed' -and $ev.usage) {
-                $status.usage = $ev.usage
-            } elseif ($ev.type -eq 'item.completed' -and $ev.item -and $ev.item.type -eq 'error') {
-                $msg = "$($ev.item.message)"
-                if ($msg -notlike 'Under-development features enabled:*') { $errList.Add($msg) }
-            } elseif ($ev.type -eq 'error' -and $ev.message) {
-                $errList.Add("$($ev.message)")
+            if ($copyTasks.Count -gt 0) {
+                try { [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$copyTasks, 10000) | Out-Null } catch {}
             }
-        }
-    }
-
-    $stderrText = (Read-SharedText $stderrFile 65536 -Tail).Trim()
-    $status.stderr_preview = if ($stderrText.Length -gt 800) { $stderrText.Substring(0, 800) } else { $stderrText }
-    if ($status.exit_code -ne 0 -and $stderrText) {
-        $errMatches = [regex]::Matches($stderrText, '(?im)^error:\s*(.+?)\s*$')
-        if ($errMatches.Count -gt 0) {
-            $errList.Add($errMatches[$errMatches.Count - 1].Groups[1].Value)
-        }
-    }
-    $status.errors = @($errList | Select-Object -Unique)
-
-    $combinedErr = ($status.errors -join "`n") + "`n" + $stderrText
-    if ($combinedErr -match 'already has an active writer') {
-        $status.error_kind = 'active_writer'
-    } elseif ($combinedErr -match 'at capacity') {
-        $status.error_kind = 'capacity'
-    }
-
-    if ($status.session_id) {
-        if (-not $status.native_session) {
-            $rolloutFile ??= Find-CodexSessionFile $status.session_id
-            $status.native_session = Get-PersistedRolloutPath $rolloutFile
-        }
-        if ($status.native_session) {
-            $status.effective = Read-EffectiveFromRollout $status.native_session
-        }
-    }
-
-    if ($status.exit_code -eq 0 -and (Test-Path -LiteralPath $handoffFile -PathType Leaf)) {
-        $handoffRaw = [System.IO.File]::ReadAllText($handoffFile, $utf8NoBom)
-        if (-not [string]::IsNullOrWhiteSpace($handoffRaw)) {
-            try {
-                $status.handoff = $handoffRaw | ConvertFrom-Json -ErrorAction Stop
-            } catch {
-                $status.handoff_raw_preview = if ($handoffRaw.Length -gt 800) { $handoffRaw.Substring(0, 800) } else { $handoffRaw }
+            if ($jobHandle -ne [IntPtr]::Zero) {
+                [CodexLoopJobHelper]::Close($jobHandle)
             }
-        }
-    }
+            if ($execGoFile -and (Test-Path -LiteralPath $execGoFile -PathType Leaf)) {
+                try { Remove-Item -LiteralPath $execGoFile -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            foreach ($s in $streams) { $s.Dispose() }
 
-    $handoffValid = $null -ne $status.handoff
-    if ($handoffValid) {
-        $handoffIssues = [System.Collections.Generic.List[string]]::new()
-        $h = $status.handoff
-        if ($h.status -eq 'needs_input' -and ($null -eq $h.questions -or @($h.questions).Count -eq 0)) {
-            $handoffIssues.Add('Invalid handoff: status is "needs_input" but "questions" is empty.')
-        }
-        if ($h.status -eq 'needs_permission' -and $null -eq $h.permission_request) {
-            $handoffIssues.Add('Invalid handoff: status is "needs_permission" but "permission_request" is null.')
-        }
-        if ($TaskKind -in 'plan', 'review' -and $null -ne $h.changed_files -and @($h.changed_files).Count -gt 0) {
-            $handoffIssues.Add("Invalid handoff: TaskKind '$TaskKind' is read-only but 'changed_files' is non-empty.")
-        }
-        if ($handoffIssues.Count -gt 0) {
-            $handoffValid = $false
-            foreach ($issue in $handoffIssues) { $errList.Add($issue) }
+            $status.exit_code = if ($proc -and $proc.HasExited) { $proc.ExitCode } else { 1 }
+            if (-not $waited -and $status.state -eq 'running') { $status.state = 'stopped' }
+
+            $errList = [System.Collections.Generic.List[string]]::new()
+            foreach ($e in $status.errors) { $errList.Add($e) }
+
+            if (Test-Path -LiteralPath $eventsFile -PathType Leaf) {
+                foreach ($line in Get-Content -LiteralPath $eventsFile -Encoding utf8) {
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                    try { $ev = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                    if ($ev.type -eq 'thread.started' -and $ev.thread_id) {
+                        $status.session_id = $ev.thread_id
+                        $status.session_confirmed = $true
+                        if ($isResume -and $initialNativeSession) { $status.native_session = $initialNativeSession }
+                        $threadStarted = $true
+                    } elseif ($ev.type -eq 'turn.completed' -and $ev.usage) {
+                        $status.usage = $ev.usage
+                    } elseif ($ev.type -eq 'item.completed' -and $ev.item -and $ev.item.type -eq 'error') {
+                        $msg = "$($ev.item.message)"
+                        if ($msg -notlike 'Under-development features enabled:*') { $errList.Add($msg) }
+                    } elseif ($ev.type -eq 'error' -and $ev.message) {
+                        $errList.Add("$($ev.message)")
+                    }
+                }
+            }
+
+            $stderrText = (Read-SharedText $stderrFile 65536 -Tail).Trim()
+            $status.stderr_preview = if ($stderrText.Length -gt 800) { $stderrText.Substring(0, 800) } else { $stderrText }
+            if ($status.exit_code -ne 0 -and $stderrText) {
+                $errMatches = [regex]::Matches($stderrText, '(?im)^error:\s*(.+?)\s*$')
+                if ($errMatches.Count -gt 0) {
+                    $errList.Add($errMatches[$errMatches.Count - 1].Groups[1].Value)
+                }
+            }
             $status.errors = @($errList | Select-Object -Unique)
-            if (-not $status.error_kind) { $status.error_kind = 'invalid_handoff' }
+
+            $combinedErr = ($status.errors -join "`n") + "`n" + $stderrText
+            if (-not $status.error_kind) {
+                if ($combinedErr -match 'already has an active writer') {
+                    $status.error_kind = 'active_writer'
+                } elseif ($combinedErr -match 'at capacity') {
+                    $status.error_kind = 'capacity'
+                }
+            }
+
+            if ($status.session_id) {
+                if (-not $status.native_session) {
+                    $rolloutFile ??= Find-CodexSessionFile $status.session_id
+                    $status.native_session = Get-PersistedRolloutPath $rolloutFile
+                }
+                if ($status.native_session -and ($threadStarted -or $status.exit_code -eq 0)) {
+                    $status.effective = Read-EffectiveFromRollout $status.native_session
+                }
+            }
+
+            $handoffValid = $false
+            if ($status.exit_code -eq 0 -and (Test-Path -LiteralPath $handoffFile -PathType Leaf)) {
+                $handoffRaw = [System.IO.File]::ReadAllText($handoffFile, $utf8NoBom)
+                if (-not [string]::IsNullOrWhiteSpace($handoffRaw)) {
+                    try {
+                        $status.handoff = $handoffRaw | ConvertFrom-Json -ErrorAction Stop
+                        # Use the exact same JSON Schema + bidirectional three-state validator as app-server.
+                        $valRes = Invoke-ValidateHandoff $nodeExe $handoffFile $schemaFile $TaskKind
+                        if ($valRes.valid) {
+                            $handoffValid = $true
+                        } else {
+                            foreach ($issue in @($valRes.errors)) { $errList.Add("$issue") }
+                            $status.errors = @($errList | Select-Object -Unique)
+                            if (-not $status.error_kind) { $status.error_kind = 'invalid_handoff' }
+                        }
+                    } catch {
+                        $status.handoff_raw_preview = if ($handoffRaw.Length -gt 800) { $handoffRaw.Substring(0, 800) } else { $handoffRaw }
+                        $errList.Add("Final handoff is not valid JSON: $($_.Exception.Message)")
+                        $status.errors = @($errList | Select-Object -Unique)
+                        if (-not $status.error_kind) { $status.error_kind = 'invalid_handoff' }
+                    }
+                }
+            }
+
+            if ($status.state -eq 'running') {
+                $status.state = if ($status.exit_code -eq 0 -and $handoffValid) { 'finished' } else { 'failed' }
+            }
+            # Cover short runs and an unsuccessful early attempt. Cancellation must not start a new helper.
+            if ($waited -and $status.native_session -and -not ($status.sidebar_registered -and $status.sidebar_title)) {
+                Register-DesktopThread | Out-Null
+            }
+            $status.finished_at = (Get-Date).ToString('o')
+            $finalOutputJson = Save-Status $status
+            $scriptExitCode = if ($status.state -eq 'finished') { 0 } elseif ($status.exit_code) { $status.exit_code } else { 1 }
         }
     }
-
-    if ($status.state -eq 'running') {
-        $status.state = if ($status.exit_code -eq 0 -and $handoffValid) { 'finished' } else { 'failed' }
+} finally {
+    if ($slotAcquired) {
+        $releasedOk = $false
+        for ($relTry = 0; $relTry -lt 3; $relTry++) {
+            try {
+                $relRes = Invoke-SlotsCommand $nodeExe 'release' @{ attempt_id = $attemptId }
+                if ($relRes -and $relRes.ok) {
+                    $releasedOk = $true
+                    break
+                }
+            } catch {}
+            Start-Sleep -Milliseconds (200 * ($relTry + 1))
+        }
+        if (-not $releasedOk) {
+            [Console]::Error.WriteLine("WARN: failed to release codex-loop slot '$attemptId' after 3 attempts; terminal status file will allow automatic reclamation.")
+        }
     }
-    # Cover short runs and an unsuccessful early attempt. Cancellation must not start a new helper.
-    if ($waited -and $status.native_session -and -not ($status.sidebar_registered -and $status.sidebar_title)) {
-        Register-DesktopThread | Out-Null
-    }
-    $status.finished_at = (Get-Date).ToString('o')
-    $finalJson = Save-Status $status
 }
 
-Write-Output $finalJson
-if ($status.state -eq 'finished') { exit 0 } elseif ($status.exit_code) { exit $status.exit_code } else { exit 1 }
+if ($finalOutputJson) { Write-Output $finalOutputJson }
+exit $scriptExitCode

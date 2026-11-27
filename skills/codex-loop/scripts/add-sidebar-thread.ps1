@@ -1,4 +1,4 @@
-#Requires -Version 7
+﻿#Requires -Version 7
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [hashtable]$Launch,
@@ -58,9 +58,9 @@ foreach ($arg in $Launch.PrefixArgs + @('app-server', '--listen', 'stdio://')) {
 }
 
 $sectionName = 'Codex 派单'
-$sectionLock = [Threading.Mutex]::new($false, 'Local\CodexLoop.DispatchSection')
+$sectionPipeName = 'codex-loop-dispatch-section'
+$sectionPipe = $null
 $deadline = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(20))
-$ownsLock = $false
 $server = $null
 try {
     $server = [Diagnostics.Process]::Start($start)
@@ -89,13 +89,16 @@ try {
     }
     if ($KeepSection -or $thread.section) { return $entry }
 
-    # Section names are not unique. Concurrent first runs must share the lookup and creation.
-    try {
-        $ownsLock = [Threading.WaitHandle]::WaitAny(@($sectionLock, $deadline.Token.WaitHandle)) -eq 0
-    } catch [Threading.AbandonedMutexException] {
-        $ownsLock = $true
+    # Share the exact same OS Named Pipe lock with app-server-runner.mjs so concurrent exec + app-server runs serialize section creation/pinning.
+    while ($null -eq $sectionPipe) {
+        try {
+            $sectionPipe = [System.IO.Pipes.NamedPipeServerStream]::new($sectionPipeName, [System.IO.Pipes.PipeDirection]::InOut, 1)
+        } catch [System.UnauthorizedAccessException], [System.IO.IOException] {
+            if ($deadline.Token.WaitHandle.WaitOne(35)) {
+                throw 'Timed out waiting to register the Codex sidebar section.'
+            }
+        }
     }
-    if (-not $ownsLock) { throw 'Timed out waiting to register the Codex sidebar section.' }
 
     $cursor = $null
     do {
@@ -129,8 +132,7 @@ try {
 } catch [OperationCanceledException] {
     throw 'Codex App Server timed out during sidebar registration.'
 } finally {
-    if ($ownsLock) { $sectionLock.ReleaseMutex() }
-    $sectionLock.Dispose()
+    if ($sectionPipe) { $sectionPipe.Dispose() }
     $deadline.Dispose()
     if ($server) {
         try {
