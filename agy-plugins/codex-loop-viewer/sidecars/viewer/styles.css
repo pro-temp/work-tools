@@ -79,6 +79,23 @@ html, body {
 .live-dot.finished { background: var(--codex); }
 .live-dot.failed { background: var(--danger); }
 .live-dot.warn { background: var(--warn); }
+.active-badge {
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: color-mix(in srgb, var(--codex) 76%, var(--fg));
+  background: color-mix(in srgb, var(--codex) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--codex) 45%, transparent);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.active-badge:hover {
+  background: color-mix(in srgb, var(--codex) 20%, transparent);
+}
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -198,8 +215,18 @@ html, body {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 5px 6px;
   font-size: 11.5px;
+  color: var(--dim);
+}
+.meta-row.turn-meta {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.meta-time, .meta-tail {
+  white-space: nowrap;
+}
+.meta-tok {
   color: var(--dim);
 }
 .meta-path {
@@ -214,23 +241,100 @@ html, body {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 1px 7px;
-  border-radius: 999px;
+  padding: 2px 7px;
+  border-radius: 6px;
   font-size: 11px;
+  line-height: 1.35;
   font-weight: 500;
   border: 1px solid var(--line);
   background: var(--surface-2);
   color: var(--fg);
   white-space: nowrap;
 }
-.pill.implement { color: var(--agy); border-color: color-mix(in srgb, var(--agy) 40%, transparent); }
-.pill.review { color: var(--purple); border-color: color-mix(in srgb, var(--purple) 40%, transparent); }
-.pill.plan { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
-.pill.desktop { color: var(--codex); border-color: color-mix(in srgb, var(--codex) 40%, transparent); }
-.pill.ok { color: var(--codex); border-color: color-mix(in srgb, var(--codex) 45%, transparent); background: color-mix(in srgb, var(--codex) 10%, transparent); }
-.pill.running { color: var(--codex); border-color: color-mix(in srgb, var(--codex) 55%, transparent); background: color-mix(in srgb, var(--codex) 14%, transparent); }
-.pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
-.pill.err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.pill.implement {
+  color: color-mix(in srgb, var(--agy) 78%, var(--fg));
+  border-color: color-mix(in srgb, var(--agy) 36%, transparent);
+  background: color-mix(in srgb, var(--agy) 8%, transparent);
+}
+.pill.review {
+  color: color-mix(in srgb, var(--purple) 78%, var(--fg));
+  border-color: color-mix(in srgb, var(--purple) 36%, transparent);
+  background: color-mix(in srgb, var(--purple) 8%, transparent);
+}
+.pill.plan {
+  color: color-mix(in srgb, var(--warn) 76%, var(--fg));
+  border-color: color-mix(in srgb, var(--warn) 38%, transparent);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.pill.desktop {
+  color: color-mix(in srgb, var(--codex) 74%, var(--fg));
+  border-color: color-mix(in srgb, var(--codex) 38%, transparent);
+  background: color-mix(in srgb, var(--codex) 8%, transparent);
+}
+.pill.ok {
+  color: color-mix(in srgb, var(--codex) 74%, var(--fg));
+  border-color: color-mix(in srgb, var(--codex) 40%, transparent);
+  background: color-mix(in srgb, var(--codex) 10%, transparent);
+}
+.pill.running {
+  color: color-mix(in srgb, var(--codex) 76%, var(--fg));
+  border-color: color-mix(in srgb, var(--codex) 48%, transparent);
+  background: color-mix(in srgb, var(--codex) 13%, transparent);
+}
+.pill.warn {
+  color: color-mix(in srgb, var(--warn) 76%, var(--fg));
+  border-color: color-mix(in srgb, var(--warn) 42%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.pill.err {
+  color: color-mix(in srgb, var(--danger) 78%, var(--fg));
+  border-color: color-mix(in srgb, var(--danger) 42%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+.pill.perm {
+  color: var(--dim);
+  background: transparent;
+  border-color: color-mix(in srgb, var(--line) 85%, transparent);
+  font-weight: 400;
+}
+.pill.model {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  border-color: color-mix(in srgb, var(--fg) 14%, transparent);
+  color: var(--fg);
+}
+.pill-sep {
+  opacity: 0.4;
+  margin: 0 1px;
+}
+.pill-effort {
+  color: var(--dim);
+  font-weight: 500;
+}
+.pill.fast {
+  color: color-mix(in srgb, #f59e0b 72%, var(--fg));
+  border-color: color-mix(in srgb, #f59e0b 40%, transparent);
+  background: color-mix(in srgb, #f59e0b 11%, transparent);
+  font-weight: 600;
+}
+.pill.fast::before {
+  content: "";
+  inline-size: 10px;
+  block-size: 10px;
+  flex-shrink: 0;
+  background-color: currentColor;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='black' d='M9.3 1.4 3.4 9.1h4.1L6.7 14.6l5.9-7.7H8.5l.8-5.5Z'/%3E%3C/svg%3E") no-repeat center / contain;
+}
+.pill.tier {
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+.pill.xs {
+  padding: 1.5px 6px;
+  font-size: 10.5px;
+}
+.meta-row .pill { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 
 /* Turns */
 .turn-card {
@@ -276,6 +380,7 @@ html, body {
 .block.agy { border-left: 3px solid var(--agy); }
 .block.codex { border-left: 3px solid var(--codex); }
 .block.handoff { border-left: 3px solid var(--purple); }
+.block.warn { border-left: 3px solid var(--warn); }
 .block.danger { border-left: 3px solid var(--danger); }
 
 .block-head {
@@ -377,6 +482,31 @@ summary:hover { background: var(--surface-2); }
 }
 .tool-group[open] > summary {
   border-bottom: 1px solid var(--line);
+}
+
+/* Collapsed-by-default error / stderr details */
+.error-details[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+.error-summary-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.error-summary-title,
+.error-summary-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.error-summary-title {
+  font-weight: 600;
+  color: var(--fg);
+}
+.error-summary-preview {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
 }
 
 /* Execution stream items */

@@ -2,6 +2,8 @@
   const FAST_POLL_MS = 1500;
   const IDLE_POLL_MS = 3500;
   const RAW_PAGE_BYTES = 512 * 1024;
+  const ERROR_PREVIEW_CHARS = 100;
+  const ANSI_CSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
   const params = new URLSearchParams(location.search);
   const conversationId = (window.sidecar && window.sidecar.conversationId) || params.get('conversationId') || '';
   const doFetch = (window.sidecar && window.sidecar.fetch) ? window.sidecar.fetch.bind(window.sidecar) : fetch.bind(window);
@@ -9,12 +11,14 @@
   const elApp = document.getElementById('app');
   const elSelect = document.getElementById('run-select');
   const elLiveDot = document.getElementById('live-dot');
+  const elActiveCount = document.getElementById('active-count');
   const elBtnOpenCodex = document.getElementById('btn-open-codex');
   const elBtnCopyLink = document.getElementById('btn-copy-link');
   const elMenu = document.getElementById('viewer-menu');
   const elOptMessagesOnly = document.getElementById('opt-messages-only');
   const elOptAutoFollow = document.getElementById('opt-autofollow');
   const elOptShowEcho = document.getElementById('opt-show-echo');
+  const elOptStripAnsi = document.getElementById('opt-strip-ansi');
   const elRawDialog = document.getElementById('raw-dialog');
   const elRawTitle = document.getElementById('raw-dialog-title');
   const elRawSub = document.getElementById('raw-dialog-sub');
@@ -183,7 +187,15 @@
   }
 
   function renderSelect() {
-    const sig = `${selectedRunId}|${runsList.map((r) => `${r.id}:${r.scope}:${r.effectiveState}:${r.title}:${r.taskKind}:${r.updatedAt}`).join(';')}`;
+    const runningRuns = runsList.filter((r) => r.effectiveState === 'running');
+    if (runningRuns.length > 1) {
+      elActiveCount.textContent = `${runningRuns.length} 并发`;
+      elActiveCount.hidden = false;
+    } else {
+      elActiveCount.hidden = true;
+    }
+
+    const sig = `${selectedRunId}|${runsList.map((r) => `${r.id}:${r.scope}:${r.effectiveState}:${r.subtaskId || ''}:${r.title}:${r.taskKind}:${r.updatedAt}`).join(';')}`;
     if (sig === lastSelectSig) return;
     lastSelectSig = sig;
 
@@ -205,8 +217,9 @@
       html += `<optgroup label="${esc(g.label)}">`;
       for (const r of items) {
         const prefix = r.effectiveState === 'running' ? '● ' : '';
+        const subTag = r.subtaskId ? `[${r.subtaskId}] ` : '';
         const t = fmtDateTime(r.updatedAt);
-        const label = `${prefix}${r.title} (${r.taskKind}${t ? ` · ${t}` : ''})`;
+        const label = `${prefix}${subTag}${r.title} (${r.taskKind}${t ? ` · ${t}` : ''})`;
         const sel = r.id === selectedRunId ? ' selected' : '';
         html += `<option value="${esc(r.id)}"${sel}>${esc(label)}</option>`;
       }
@@ -234,6 +247,26 @@
     const hasSession = Boolean(run.sessionId && run.desktopUrl);
     elBtnOpenCodex.disabled = !hasSession;
     elBtnCopyLink.disabled = !hasSession;
+  }
+
+  function renderErrorDetails(key, title, text, actionHtml = '') {
+    const lines = text.trim().split(/\r?\n/);
+    const firstLine = lines[0].replace(ANSI_CSI_RE, '').trim() || lines[0];
+    const preview = firstLine.length > ERROR_PREVIEW_CHARS
+      ? `${firstLine.slice(0, ERROR_PREVIEW_CHARS)}…` : firstLine;
+    const bodyText = elOptStripAnsi.checked ? text.replace(ANSI_CSI_RE, '') : text;
+    return `
+      <details class="block danger error-details" data-key="${esc(key)}"${openAttr(key, false)}>
+        <summary>
+          <span class="summary-label error-summary-label">
+            <span class="error-summary-title">${esc(title)}</span>
+            <span class="error-summary-preview">${esc(preview)}</span>
+          </span>
+          ${lines.length > 1 ? `<span class="summary-meta">${lines.length} 行</span>` : ''}
+        </summary>
+        ${actionHtml}
+        <pre class="verbatim compact" data-scroll-key="${esc(key)}:text">${esc(bodyText)}</pre>
+      </details>`;
   }
 
   function renderStreamItem(runId, turn, item, idx) {
@@ -356,21 +389,43 @@
 
     if (item.kind === 'user_message') {
       const copyKey = registerCopy(turn.turnId, item.text);
+      const label = item.isFollowUp
+        ? 'AGY → Codex · 打断后重开'
+        : (item.isSteer ? 'AGY → Codex · 轮中纠偏' : '轮内追加指令');
+      const badge = item.isFollowUp
+        ? '<span class="pill xs warn">新回合</span>'
+        : (item.isSteer ? '<span class="pill xs ok">已进入本轮</span>' : '');
       return `
         <div class="block agy">
           <div class="block-head">
-            <span class="block-title">轮内追加指令</span>
+            <span class="block-title">${label} ${badge}</span>
             <button type="button" class="btn xs" data-copy-key="${esc(copyKey)}">复制</button>
           </div>
           <pre class="verbatim prose">${esc(item.text)}</pre>
         </div>`;
     }
 
+    if (item.kind === 'notice') {
+      return `
+        <div class="block warn">
+          <div class="block-head"><span class="block-title">控制事件</span></div>
+          <pre class="verbatim compact">${esc(item.message)}</pre>
+        </div>`;
+    }
+
     if (item.kind === 'error') {
+      const message = String(item.message);
+      const trimmed = message.trim();
+      if (trimmed.length > ERROR_PREVIEW_CHARS || /[\r\n]/.test(trimmed)) {
+        // Anonymous events keep their slot in turn.items even when rollout reasonings are prepended.
+        const eventKey = item.id ? `id:${item.id}` : `index:${idx - turn.reasonings.length}`;
+        return renderErrorDetails(`${runId}:${turn.turnId}:error:${eventKey}`, '错误事件', message);
+      }
+      const displayMsg = elOptStripAnsi.checked ? message.replace(ANSI_CSI_RE, '') : message;
       return `
         <div class="block danger">
           <div class="block-head"><span class="block-title">错误事件</span></div>
-          <pre class="verbatim compact">${esc(item.message)}</pre>
+          <pre class="verbatim compact">${esc(displayMsg)}</pre>
         </div>`;
     }
 
@@ -493,7 +548,7 @@
 
   function isDirectMessageItem(item) {
     if (item.kind === 'agent_message') return !item.isHandoffEcho || elOptShowEcho.checked;
-    return item.kind === 'user_message' || item.kind === 'error';
+    return item.kind === 'user_message' || item.kind === 'error' || item.kind === 'notice';
   }
 
   function formatToolGroupSummary(items) {
@@ -578,12 +633,44 @@
     return segments.join('');
   }
 
+  function renderModelSettings(settings, source, turnNumber, pillClass) {
+    if (!source) return { badges: '', stateTitle: '' };
+    const { model, effort, service_tier: tier } = settings;
+    const requested = source === 'requested';
+    const sourceLabel = requested ? '请求参数（待生效）' : `本轮生效（${source}）`;
+    const prefix = requested ? '请求 ' : '';
+    const fast = /^(priority|fast)$/i.test(tier);
+    const standard = tier === 'default';
+    const mode = fast ? 'Fast 模式 ' : standard ? '标准模式 ' : '';
+    const titleParts = [];
+    if (model) titleParts.push(`模型: ${model}`);
+    if (effort) titleParts.push(`Effort: ${effort}`);
+    if (tier) titleParts.push(`${mode}(service_tier: ${tier})`);
+    titleParts.push(sourceLabel, `第 ${turnNumber} 轮`);
+    const title = ` title="${esc(titleParts.join(' · '))}"`;
+    const badges = [];
+    if (model || effort) {
+      const inner = model && effort
+        ? `${esc(prefix + model)}<span class="pill-sep">·</span><span class="pill-effort">${esc(effort)}</span>`
+        : esc(prefix + (model || effort));
+      badges.push(`<span class="${pillClass} model"${title}>${inner}</span>`);
+    }
+    if (tier && !standard) {
+      badges.push(`<span class="${pillClass}${fast ? ' fast' : ' tier'}"${title}>${esc(prefix + (fast ? 'Fast' : tier))}</span>`);
+    }
+    if (requested && !badges.length) badges.push(`<span class="${pillClass} perm"${title}>请求</span>`);
+    // A default tier on its own uses the existing state pill for its tooltip.
+    return { badges: badges.join(''), stateTitle: badges.length ? '' : title };
+  }
+
   function renderTurnInner(run, turn) {
     const runId = run.id;
     const [stText, stCls] = stateLabel(turn.effectiveState);
     const dur = fmtDuration(turn.startedAt, turn.finishedAt);
     const tok = fmtTokens(turn.usage);
-    const modelInfo = [turn.effective?.model, turn.effective?.effort, turn.requestedMode].filter(Boolean).join(' · ');
+    const settings = renderModelSettings(
+      turn.effective || turn.requested, turn.effectiveSource || (turn.requested ? 'requested' : null), turn.turnNumber, 'pill xs',
+    );
 
     const promptKey = `${runId}:${turn.turnId}:prompt`;
 
@@ -623,22 +710,24 @@
 
     const streamHtml = renderTurnFlow(runId, turn);
 
-    const errorsHtml = (turn.errors?.length || turn.stderr) ? `
-      <div class="block danger">
+    const errorText = [turn.errors.join('\n'), turn.stderr].filter((text) => text.trim()).join('\n\n');
+    const errorsHtml = errorText ? renderErrorDetails(
+      `${runId}:${turn.turnId}:errors`,
+      turn.errorKind ? `异常 / Stderr (${turn.errorKind})` : '异常 / Stderr',
+      errorText,
+      turn.rawFiles.includes('stderr') ? `
         <div class="block-head">
-          <span class="block-title">异常 / Stderr${turn.errorKind ? ` (${esc(turn.errorKind)})` : ''}</span>
-          ${turn.rawFiles?.includes('stderr') ? `<button type="button" class="btn xs" data-run-id="${esc(runId)}" data-raw-turn="${esc(turn.turnId)}" data-raw-kind="stderr">完整 Stderr</button>` : ''}
-        </div>
-        ${turn.errors?.length ? `<pre class="verbatim compact">${esc(turn.errors.join('\n'))}</pre>` : ''}
-        ${turn.stderr ? `<pre class="verbatim compact" style="border-top:1px solid var(--line)">${esc(turn.stderr)}</pre>` : ''}
-      </div>` : '';
+          <span>Stderr 原文</span>
+          <button type="button" class="btn xs" data-run-id="${esc(runId)}" data-raw-turn="${esc(turn.turnId)}" data-raw-kind="stderr">完整 Stderr</button>
+        </div>` : '',
+    ) : '';
 
     return `
       <div class="turn-head">
         <div class="turn-head-left">
           <span>第 ${turn.turnNumber} 轮 · ${esc(modeLabel(turn))}</span>
           <span class="pill ${esc(turn.taskKind)}">${esc(turn.taskKind)}</span>
-          <span class="pill ${stCls}">${esc(stText)}</span>
+          <span class="pill ${stCls}"${settings.stateTitle}>${esc(stText)}</span>
           ${dur ? `<span class="dim">${esc(dur)}</span>` : ''}
         </div>
         <div class="turn-head-right">
@@ -646,11 +735,12 @@
           ${rawButtons}
         </div>
       </div>
-      ${(modelInfo || tok || turn.startedAt) ? `
-        <div class="meta-row" style="padding:5px 10px;border-bottom:1px solid var(--line)">
-          ${turn.startedAt ? `<span>${esc(fmtTime(turn.startedAt))}</span>` : ''}
-          ${modelInfo ? `<span>· ${esc(modelInfo)}</span>` : ''}
-          ${tok ? `<span>· ${esc(tok)}</span>` : ''}
+      ${(settings.badges || turn.requestedMode || tok || turn.startedAt) ? `
+        <div class="meta-row turn-meta">
+          ${turn.startedAt ? `<span class="meta-time">${esc(fmtTime(turn.startedAt))}</span>` : ''}
+          ${turn.requestedMode ? `<span class="pill xs perm">权限 ${esc(turn.requestedMode)}</span>` : ''}
+          ${settings.badges}
+          ${tok ? `<span class="meta-tok">${esc(tok)}</span>` : ''}
         </div>` : ''}
       <div class="turn-body">
         ${promptHtml}
@@ -662,11 +752,16 @@
 
   function renderHeaderHtml(run, turnsCount) {
     const [stText, stCls] = stateLabel(run.effectiveState);
+    const settings = renderModelSettings(
+      { model: run.model, effort: run.effort, service_tier: run.serviceTier }, run.metaSource, run.metaTurnNumber, 'pill',
+    );
     const metaBadges = [
       `<span class="pill ${esc(run.taskKind)}">${esc(run.taskKind)}</span>`,
-      `<span class="pill ${stCls}">${esc(stText)}</span>`,
-      run.mode ? `<span class="pill">mode: ${esc(run.mode)}</span>` : '',
-      run.model ? `<span class="pill">${esc(run.model)}${run.effort ? ` (${esc(run.effort)})` : ''}</span>` : '',
+      `<span class="pill ${stCls}"${settings.stateTitle}>${esc(stText)}</span>`,
+      run.subtaskId ? `<span class="pill perm" title="${esc(run.batchId ? `批次 ${run.batchId}` : '并发子单')}">子单 ${esc(run.subtaskId)}</span>` : '',
+      run.worktreePath ? `<span class="pill perm" title="${esc(`隔离 worktree: ${run.worktreePath}`)}">worktree</span>` : '',
+      run.mode ? `<span class="pill perm">权限 ${esc(run.mode)}</span>` : '',
+      settings.badges,
       run.rolloutOnly ? '<span class="pill warn">归档（读原生 rollout）</span>' : '',
     ].filter(Boolean).join('');
 
@@ -675,8 +770,7 @@
         <div class="run-title">${esc(run.title)}</div>
         <div class="meta-row">
           ${metaBadges}
-          <span>· ${turnsCount} 轮</span>
-          ${run.sessionId ? `<span class="mono">· ${esc(run.sessionId.slice(0, 8))}</span>` : ''}
+          <span class="meta-tail">${turnsCount} 轮${run.sessionId ? ` · <span class="mono">${esc(run.sessionId.slice(0, 8))}</span>` : ''}</span>
         </div>
         ${run.workDir ? `<div class="meta-path">${esc(run.workDir)}</div>` : ''}
       </div>`;
@@ -694,6 +788,9 @@
       start: turn.startedAt,
       fin: turn.finishedAt,
       eff: turn.effective,
+      effectiveSource: turn.effectiveSource,
+      requested: turn.requested,
+      ctrl: turn.controlEvents,
       tok: turn.usage,
       ek: turn.errorKind,
       errs: turn.errors,
@@ -709,6 +806,7 @@
       diffSid: Boolean(turn.sessionId && turn.sessionId !== run.sessionId),
       msgOnly: elOptMessagesOnly.checked,
       echo: elOptShowEcho.checked,
+      stripAnsi: elOptStripAnsi.checked,
     });
   }
 
@@ -748,7 +846,11 @@
       const headerSlot = elApp.querySelector('#run-header-slot');
       const turnsSlot = elApp.querySelector('#turns-slot');
 
-      const headerSig = `${run.title}|${run.taskKind}|${run.workDir}|${run.effectiveState}|${run.mode}|${run.model}|${run.effort}|${run.sessionId}|${run.rolloutOnly}|${detail.turns.length}`;
+      const headerSig = JSON.stringify([
+        run.title, run.taskKind, run.workDir, run.worktreePath, run.subtaskId, run.batchId,
+        run.effectiveState, run.mode, run.model, run.effort,
+        run.serviceTier, run.metaSource, run.metaTurnNumber, run.sessionId, run.rolloutOnly, detail.turns.length,
+      ]);
       if (headerSig !== renderedHeaderSig) {
         renderedHeaderSig = headerSig;
         headerSlot.innerHTML = renderHeaderHtml(run, detail.turns.length);
@@ -967,12 +1069,12 @@
         return;
       }
 
-      const stillExists = runsList.some((r) => r.id === selectedRunId);
-      if (!selectedRunId || !stillExists) {
+      const currentSelected = runsList.find((r) => r.id === selectedRunId);
+      if (!selectedRunId || !currentSelected) {
         selectedRunId = runsPayload.defaultRunId || runsList[0].id;
         currentEtag = '';
         userPickedRun = false;
-      } else if (!userPickedRun && runsPayload.defaultRunId && runsPayload.defaultRunId !== selectedRunId) {
+      } else if (!userPickedRun && currentSelected.effectiveState !== 'running' && runsPayload.defaultRunId && runsPayload.defaultRunId !== selectedRunId) {
         const newestInConv = runsList.find((r) => r.id === runsPayload.defaultRunId && r.scope === 'conversation');
         if (newestInConv) {
           selectedRunId = newestInConv.id;
@@ -1030,6 +1132,17 @@
       openState.set(target.dataset.key, target.open);
     }
   }, { capture: true });
+
+  elActiveCount.addEventListener('click', () => {
+    const running = runsList.filter((r) => r.effectiveState === 'running');
+    if (running.length < 2) return;
+    const idx = running.findIndex((r) => r.id === selectedRunId);
+    const next = running[(idx + 1) % running.length];
+    selectedRunId = next.id;
+    userPickedRun = true;
+    elSelect.value = selectedRunId;
+    requestPoll(true);
+  });
 
   elSelect.addEventListener('change', () => {
     selectedRunId = elSelect.value;
@@ -1096,7 +1209,18 @@
     if (currentDetail) renderDetail(currentDetail, true);
   });
 
+  elOptStripAnsi.addEventListener('change', () => {
+    if (currentDetail) renderDetail(currentDetail, true);
+  });
+
   elApp.addEventListener('click', (event) => {
+    const summary = event.target.closest('details[data-key] > summary');
+    if (summary) {
+      // A refresh can replace the details before the browser delivers its queued toggle event.
+      const details = summary.parentElement;
+      openState.set(details.dataset.key, !details.open);
+      return;
+    }
     const btn = event.target.closest('button');
     if (!btn) return;
     if (btn.dataset.copyKey) {

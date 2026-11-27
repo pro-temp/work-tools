@@ -269,6 +269,7 @@ export function resolveRolloutBySessionId(sessionId, hintPath = null) {
 function isConfirmedSessionStatus(d) {
   if (!d || !UUID_RE.test(d.session_id || '')) return false;
   if (d.error_kind === 'invalid_session') return false;
+  if (d.session_confirmed === false) return false;
   return Boolean(d.desktop_url || d.native_session || d.sidebar_registered || d.state === 'finished');
 }
 
@@ -381,6 +382,31 @@ function computeTurnEffectiveState(data) {
   return { effectiveState: alive ? 'running' : 'interrupted', isAlive: alive };
 }
 
+function settingsOrNull(settings) {
+  return settings && (settings.model || settings.effort || settings.service_tier || settings.approval || settings.sandbox)
+    ? settings : null;
+}
+
+function requestedSettings(data) {
+  return settingsOrNull({
+    model: data.requested_model ?? null,
+    effort: data.requested_effort ?? null,
+    service_tier: data.requested_tier ?? null,
+  });
+}
+
+function runSettingsMeta(turns, activeTurn) {
+  const focus = activeTurn || turns.findLast((t) => t.effective || t.requested);
+  const settings = focus?.effective || focus?.requested;
+  return {
+    model: settings?.model ?? null,
+    effort: settings?.effort ?? null,
+    serviceTier: settings?.service_tier ?? null,
+    metaSource: focus?.effectiveSource || (focus?.requested ? 'requested' : null),
+    metaTurnNumber: focus?.turnNumber ?? null,
+  };
+}
+
 function summarizeRunDir(runDir, seedMeta, appDataDir) {
   const statusFiles = listStatusFilesInDir(runDir);
   if (statusFiles.length === 0) return null;
@@ -414,10 +440,8 @@ function summarizeRunDir(runDir, seedMeta, appDataDir) {
   // Keep strictly paired confirmed sessions (never mix session B's ID with session A's desktopUrl/nativeSession).
   const confirmedMap = new Map();
   let sidebarTitle = null;
-  let effective = null;
   for (const { data: d } of statuses) {
     if (d.sidebar_title) sidebarTitle = d.sidebar_title;
-    if (d.effective && (d.effective.model || d.effective.effort)) effective = d.effective;
     if (!isConfirmedSessionStatus(d)) continue;
     const sid = d.session_id.toLowerCase();
     const prev = confirmedMap.get(sid);
@@ -444,16 +468,20 @@ function summarizeRunDir(runDir, seedMeta, appDataDir) {
   }
   if (!title) title = basename(runDir);
 
-  let isAlive = false;
-  let effectiveState = computeTurnEffectiveState(latest).effectiveState;
-  for (const { data: d } of statuses) {
-    const st = computeTurnEffectiveState(d);
-    if (st.isAlive) {
-      isAlive = true;
-      effectiveState = 'running';
-      break;
-    }
-  }
+  const turns = statuses.map(({ data }, idx) => {
+    const confirmedAppServer = data.engine === 'app-server' && isConfirmedSessionStatus(data);
+    const effective = (data.state === 'finished' || data.exit_code === 0 || confirmedAppServer)
+      ? settingsOrNull(data.effective)
+      : null;
+    return {
+      turnNumber: idx + 1,
+      effectiveState: computeTurnEffectiveState(data).effectiveState,
+      effective,
+      effectiveSource: effective ? 'status' : null,
+      requested: requestedSettings(data),
+    };
+  });
+  const activeTurn = turns.findLast((t) => t.effectiveState === 'running');
 
   const startedAt = first.started_at || new Date(statuses[0].file.mtimeMs).toISOString();
   const updatedMs = Math.max(
@@ -467,6 +495,10 @@ function summarizeRunDir(runDir, seedMeta, appDataDir) {
     id: makeRunId(`dir:${normPath(runDir)}`),
     runDir,
     workDir,
+    worktreePath: latest.worktree_path || first.worktree_path || seedMeta?.worktree_path || null,
+    engine: latest.engine || first.engine || seedMeta?.engine || null,
+    batchId: latest.batch_id || first.batch_id || seedMeta?.batch_id || null,
+    subtaskId: latest.subtask_id || first.subtask_id || seedMeta?.subtask_id || null,
     conversationId,
     sessionId: latestConfirmed?.sessionId || null,
     desktopUrl: latestConfirmed?.desktopUrl || null,
@@ -475,11 +507,10 @@ function summarizeRunDir(runDir, seedMeta, appDataDir) {
     title,
     taskKind: latest.task_kind || first.task_kind || 'implement',
     mode: latest.requested_mode || first.requested_mode || null,
-    model: effective?.model || latest.requested_model || first.requested_model || null,
-    effort: effective?.effort || latest.requested_effort || first.requested_effort || null,
+    ...runSettingsMeta(turns, activeTurn),
     state: latest.state || 'unknown',
-    effectiveState,
-    isAlive,
+    effectiveState: activeTurn ? 'running' : turns[turns.length - 1].effectiveState,
+    isAlive: Boolean(activeTurn),
     turnsCount: statuses.length,
     startedAt,
     updatedAt,
@@ -584,6 +615,10 @@ export function discoverRuns(appDataDir, conversationId = '', workspacesInput = 
       id: makeRunId(`rollout:${normPath(seed.run_dir || latest.nativeSession)}`),
       runDir: seed.run_dir,
       workDir: seed.work_dir || '',
+      worktreePath: seed.worktree_path || null,
+      engine: seed.engine || null,
+      batchId: seed.batch_id || null,
+      subtaskId: seed.subtask_id || null,
       conversationId: seed.conversation_id || null,
       sessionId: latest.sessionId,
       desktopUrl: latest.desktopUrl,
@@ -592,8 +627,7 @@ export function discoverRuns(appDataDir, conversationId = '', workspacesInput = 
       title: seed.title || basename(seed.run_dir || latest.nativeSession),
       taskKind: seed.task_kind || 'implement',
       mode: null,
-      model: null,
-      effort: null,
+      ...runSettingsMeta([]),
       state: seed.state || 'finished',
       effectiveState: seed.state === 'running' ? 'interrupted' : (seed.state || 'finished'),
       isAlive: false,
@@ -700,6 +734,18 @@ function normalizeEventItem(item, workDir) {
       : [];
     return { kind: 'file_change', id, status, changes };
   }
+  if (item.type === 'user_message') {
+    return {
+      kind: 'user_message',
+      id,
+      status,
+      text: item.text || '',
+      clientId: item.client_id || null,
+      isSteer: Boolean(item.is_steer),
+      isFollowUp: Boolean(item.is_followup),
+      turnId: item.turn_id || null,
+    };
+  }
   if (item.type === 'web_search') {
     return { kind: 'web_search', id, status, query: item.query || '' };
   }
@@ -733,6 +779,9 @@ function consumeEventLine(line, state, workDir) {
   } else if (ev.type === 'turn.completed') {
     state.enteredTurn = true;
     if (ev.usage) state.usage = ev.usage;
+  } else if (ev.type === 'turn.interrupted') {
+    state.enteredTurn = true;
+    state.items.push({ kind: 'notice', id: null, status: 'stopped', message: '本轮已由主控中止（turn/interrupt）' });
   } else if (ev.type === 'error' || ev.type === 'turn.failed') {
     const msg = ev.message || ev.error?.message || JSON.stringify(ev);
     state.items.push({ kind: 'error', id: null, status: 'failed', message: msg });
@@ -868,6 +917,19 @@ function extractMessageText(content) {
     .join('\n\n');
 }
 
+function rolloutSettingsPatch(payload, isContext) {
+  const patch = {};
+  if ('model' in payload) patch.model = payload.model;
+  if ('approval_policy' in payload) patch.approval = payload.approval_policy;
+  if ('service_tier' in payload) patch.service_tier = payload.service_tier;
+  if (isContext && 'sandbox_policy' in payload) patch.sandbox = payload.sandbox_policy?.type ?? null;
+
+  const effortKey = isContext ? 'effort' : 'reasoning_effort';
+  const effort = effortKey in payload ? payload[effortKey] : payload.collaboration_mode?.settings?.reasoning_effort;
+  if (effort !== undefined) patch.effort = effort;
+  return patch;
+}
+
 // Streaming rollout parser supporting arbitrarily large plain .jsonl and compressed .jsonl.zst files.
 async function parseRolloutJsonl(rolloutPath) {
   const st = statInfo(rolloutPath);
@@ -877,6 +939,8 @@ async function parseRolloutJsonl(rolloutPath) {
   if (cached && cached.stamp === stamp) return { ok: true, ...cached.parsed };
 
   const turns = [];
+  const activeSettings = {};
+  const turnByCodexId = new Map();
   let current = null;
   const toolIndex = new Map();
 
@@ -890,12 +954,14 @@ async function parseRolloutJsonl(rolloutPath) {
       finishedAt: null,
       completed: false,
       aborted: false,
+      settings: { ...activeSettings },
       promptText: '',
       reasonings: [],
       items: [],
       assistantText: '',
     };
     turns.push(current);
+    if (codexTurnId) turnByCodexId.set(codexTurnId, current);
     return current;
   }
 
@@ -923,17 +989,28 @@ async function parseRolloutJsonl(rolloutPath) {
         continue;
       }
 
+      const p = obj.payload;
+      if (!p) continue;
       const ts = obj.timestamp || null;
-      if (obj.type === 'event_msg' && obj.payload) {
-        if (obj.payload.type === 'task_started') {
-          startTurn(ts, true, obj.payload.turn_id || null);
-        } else if (obj.payload.type === 'task_complete') {
+      const isContext = obj.type === 'turn_context';
+      if (isContext || (obj.type === 'event_msg' && p.type === 'thread_settings_applied')) {
+        const patch = rolloutSettingsPatch(isContext ? p : p.thread_settings, isContext);
+        Object.assign(activeSettings, patch);
+        const openTurn = current && !current.completed && !current.aborted ? current : null;
+        const target = (isContext && turnByCodexId.get(p.turn_id)) || openTurn;
+        if (target) Object.assign(target.settings, patch);
+        continue;
+      }
+      if (obj.type === 'event_msg') {
+        if (p.type === 'task_started') {
+          startTurn(ts, true, p.turn_id || null);
+        } else if (p.type === 'task_complete') {
           if (current) {
             current.completed = true;
             current.lastActivityAt = ts || current.lastActivityAt;
             current.finishedAt = ts || current.lastActivityAt;
           }
-        } else if (obj.payload.type === 'turn_aborted' || obj.payload.type === 'error') {
+        } else if (p.type === 'turn_aborted' || p.type === 'error') {
           if (current) {
             current.aborted = true;
             current.lastActivityAt = ts || current.lastActivityAt;
@@ -943,8 +1020,7 @@ async function parseRolloutJsonl(rolloutPath) {
         continue;
       }
 
-      if (obj.type !== 'response_item' || !obj.payload) continue;
-      const p = obj.payload;
+      if (obj.type !== 'response_item') continue;
 
       if (p.type === 'message' && p.role === 'user') {
         const text = extractMessageText(p.content);
@@ -1033,6 +1109,8 @@ async function parseRolloutJsonl(rolloutPath) {
   }
 
   const nonEmptyTurns = turns.filter((t) => t.promptText || t.items.length > 0 || t.completed || t.aborted);
+  // Keep the sparse snapshot for status merging: an explicit null clears a field, an absent key may be filled.
+  for (const turn of nonEmptyTurns) turn.effective = settingsOrNull(turn.settings);
   const parsed = { turns: nonEmptyTurns, mtimeMs: st.mtimeMs };
   setBounded(rolloutCache, rolloutPath, { stamp, parsed }, 32);
   return { ok: true, ...parsed };
@@ -1170,7 +1248,9 @@ export async function readRunDetail(entry, clientEtag = '') {
           desktopUrl: s.desktopUrl,
           startedAt: rt.startedAt,
           finishedAt: rt.finishedAt,
-          effective: null,
+          effective: rt.effective,
+          effectiveSource: rt.effective ? 'rollout' : null,
+          requested: null,
           usage: null,
           errorKind: null,
           errors: [],
@@ -1193,13 +1273,14 @@ export async function readRunDetail(entry, clientEtag = '') {
     turns.sort((a, b) => (Date.parse(a.startedAt || '') || 0) - (Date.parse(b.startedAt || '') || 0));
     turns.forEach((t, idx) => { t.turnNumber = idx + 1; });
 
-    const runningTurn = turns.find((t) => t.effectiveState === 'running');
+    const runningTurn = turns.findLast((t) => t.effectiveState === 'running');
     const latest = turns[turns.length - 1];
     return {
       unchanged: false,
       etag,
       run: {
         ...entry,
+        ...runSettingsMeta(turns, runningTurn),
         turnsCount: turns.length,
         state: runningTurn?.state || latest?.state || entry.state,
         effectiveState: runningTurn?.effectiveState || latest?.effectiveState || entry.effectiveState,
@@ -1265,7 +1346,7 @@ export async function readRunDetail(entry, clientEtag = '') {
 
   for (let idx = 0; idx < manifests.length; idx++) {
     const { turnId, data, effectiveState, files } = manifests[idx];
-    const workDir = data.work_dir || entry.workDir || '';
+    const workDir = data.effective_work_dir || data.worktree_path || data.work_dir || entry.workDir || '';
     const confirmed = isConfirmedSessionStatus(data);
     const sid = confirmed ? data.session_id.toLowerCase() : null;
 
@@ -1289,21 +1370,59 @@ export async function readRunDetail(entry, clientEtag = '') {
       ? parseEventsIncremental(files.events, workDir, handoffRaw.trim())
       : { items: [], usage: null, eventCount: 0, hasReasoning: false, enteredTurn: false };
 
+    const confirmedAppServer = data.engine === 'app-server' && confirmed;
     const enteredCodexTurn = parsedEvents.enteredTurn || data.state === 'finished' || data.exit_code === 0;
     let rolloutTurn = null;
-    if (sid && enteredCodexTurn && rolloutsBySession.has(sid)) {
+    const matchedRolloutTurns = [];
+    if (sid && (enteredCodexTurn || confirmedAppServer) && rolloutsBySession.has(sid)) {
       if (!consumedRolloutBySession.has(sid)) consumedRolloutBySession.set(sid, new Set());
-      rolloutTurn = matchRolloutTurn(
-        rolloutsBySession.get(sid).parsed.turns,
-        consumedRolloutBySession.get(sid),
-        { promptText, startedAt: data.started_at, finishedAt: data.finished_at },
-      );
+      const consumed = consumedRolloutBySession.get(sid);
+      const allRolloutTurns = rolloutsBySession.get(sid).parsed.turns;
+      const recordedTurnIds = Array.isArray(data.turn_ids)
+        ? new Set(data.turn_ids.filter((id) => typeof id === 'string' && id.trim()))
+        : null;
+
+      // Consume every native rollout turn recorded by this attempt (including interrupt + FollowUp replacement turns).
+      if (recordedTurnIds && recordedTurnIds.size > 0) {
+        for (let i = 0; i < allRolloutTurns.length; i++) {
+          if (consumed.has(i)) continue;
+          const rt = allRolloutTurns[i];
+          if (rt.codexTurnId && recordedTurnIds.has(rt.codexTurnId)) {
+            consumed.add(i);
+            matchedRolloutTurns.push(rt);
+          }
+        }
+      }
+      if (matchedRolloutTurns.length > 0) {
+        rolloutTurn = matchedRolloutTurns[matchedRolloutTurns.length - 1];
+      } else if (enteredCodexTurn) {
+        rolloutTurn = matchRolloutTurn(
+          allRolloutTurns,
+          consumed,
+          { promptText, startedAt: data.started_at, finishedAt: data.finished_at },
+        );
+        if (rolloutTurn) matchedRolloutTurns.push(rolloutTurn);
+      }
     }
 
-    if (!promptText && rolloutTurn?.promptText) {
-      promptText = rolloutTurn.promptText;
+    if (!promptText && matchedRolloutTurns[0]?.promptText) {
+      promptText = matchedRolloutTurns[0].promptText;
       promptSource = 'rollout';
     }
+
+    let effective = null;
+    if (enteredCodexTurn || confirmedAppServer) {
+      const statusEff = settingsOrNull(data.effective);
+      if (!rolloutTurn) {
+        effective = statusEff;
+      } else if (confirmedAppServer || data.state === 'finished') {
+        effective = settingsOrNull({ ...(statusEff || {}), ...(rolloutTurn.settings || {}) });
+      } else {
+        effective = rolloutTurn.effective;
+      }
+    }
+
+    const combinedRolloutReasonings = matchedRolloutTurns.flatMap((rt) => rt.reasonings || []);
 
     const stderr = files.stderr ? (readFullUtf8(files.stderr) || '').trim() : '';
 
@@ -1326,18 +1445,24 @@ export async function readRunDetail(entry, clientEtag = '') {
       effectiveState,
       exitCode: data.exit_code ?? null,
       sessionId: sid,
-      attemptedSessionId: !confirmed && data.session_id ? data.session_id : null,
+      attemptedSessionId: !confirmed ? (data.attempted_session_id || data.session_id || null) : null,
       desktopUrl: sid ? (data.desktop_url || `codex://threads/${sid}`) : null,
       startedAt: data.started_at || null,
       finishedAt: data.finished_at || null,
-      effective: data.effective || null,
+      effective,
+      effectiveSource: effective ? (rolloutTurn?.effective ? 'rollout' : 'status') : null,
+      requested: requestedSettings(data),
+      engine: data.engine || null,
+      activeTurnId: data.active_turn_id || null,
+      worktreePath: data.worktree_path || null,
+      controlEvents: Array.isArray(data.control_events) ? data.control_events : [],
       usage: data.usage || parsedEvents.usage || null,
       errorKind: data.error_kind || null,
       errors: Array.isArray(data.errors) ? data.errors : [],
       promptText,
       promptSource,
       items: parsedEvents.items,
-      reasonings: !parsedEvents.hasReasoning && rolloutTurn?.reasonings?.length ? rolloutTurn.reasonings : [],
+      reasonings: !parsedEvents.hasReasoning && combinedRolloutReasonings.length ? combinedRolloutReasonings : [],
       eventCount: parsedEvents.eventCount,
       handoff: decorateHandoffFileUris(handoff, workDir),
       handoffRaw,
@@ -1368,7 +1493,9 @@ export async function readRunDetail(entry, clientEtag = '') {
         desktopUrl: wrap.desktopUrl,
         startedAt: rt.startedAt,
         finishedAt: rt.finishedAt,
-        effective: null,
+        effective: rt.effective,
+        effectiveSource: rt.effective ? 'rollout' : null,
+        requested: null,
         usage: null,
         errorKind: null,
         errors: [],
@@ -1394,17 +1521,17 @@ export async function readRunDetail(entry, clientEtag = '') {
   });
   turns.forEach((t, idx) => { t.turnNumber = idx + 1; });
 
-  // Derive top-level run state: active codex_loop turn first, then active desktop turn, else latest codex_loop turn.
-  const runningLoopTurn = loopTurns.find((t) => t.effectiveState === 'running');
-  const runningDesktopTurn = desktopTurns.find((t) => t.effectiveState === 'running');
+  const runningTurn = loopTurns.findLast((t) => t.effectiveState === 'running')
+    || turns.findLast((t) => t.effectiveState === 'running');
   const latestLoopTurn = loopTurns[loopTurns.length - 1];
   const latestConfirmedTurn = [...loopTurns].reverse().find((t) => t.sessionId);
 
   const runMeta = {
     ...entry,
+    ...runSettingsMeta(turns, runningTurn),
     turnsCount: turns.length,
-    state: runningLoopTurn?.state || runningDesktopTurn?.state || latestLoopTurn?.state || entry.state,
-    effectiveState: runningLoopTurn?.effectiveState || runningDesktopTurn?.effectiveState || latestLoopTurn?.effectiveState || entry.effectiveState,
+    state: runningTurn?.state || latestLoopTurn?.state || entry.state,
+    effectiveState: runningTurn?.effectiveState || latestLoopTurn?.effectiveState || entry.effectiveState,
     sessionId: latestConfirmedTurn?.sessionId || entry.sessionId,
     desktopUrl: latestConfirmedTurn?.desktopUrl || entry.desktopUrl,
   };
