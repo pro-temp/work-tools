@@ -118,11 +118,11 @@ pwsh -NoProfile -File "<skill-dir>\scripts\run-codex.ps1" `
 
 - **私有 `app-server` 引擎与实时纠偏打断**：默认每单启动独立 `codex app-server --listen stdio://` 子进程并开放本地认证 Named Pipe 控制通道（保留 `-Engine exec` 兼容回退），支持运行中通过 [scripts/steer-codex.ps1](./scripts/steer-codex.ps1) 立即发 `turn/steer` 原地纠偏转向（带 `clientUserMessageId` 幂等对账）或 `turn/interrupt` 优雅中止/换轮，无需干等结束后 `resume`。
 - **硬并发上限 2 与自动 `git worktree` 双写隔离**：通过 Windows Named Pipe 跨进程排他锁与独立槽位表（[scripts/lib/slots.mjs](./scripts/lib/slots.mjs)）硬限最多 2 个在跑派单（满额返回 `slots_full`），配合 Windows Job Object（`KILL_ON_JOB_CLOSE`）防止崩溃孤儿占槽；同仓并发写任务可通过 [scripts/worktree-codex.ps1](./scripts/worktree-codex.ps1) 自动执行 `prepare` / `inspect` / `integrate -DryRun` / `integrate` / `cleanup` 隔离集成闭环（`-LinkDirs` 为共享可写目录联接，仅适用于不会写入依赖目录的子单）。
-- **强结构化回执**：通过 [references/codex-handoff.schema.json](./references/codex-handoff.schema.json) 与 [scripts/lib/schema-validate.mjs](./scripts/lib/schema-validate.mjs) 约束 11 个必填字段，强制自报每一条新增防御逻辑及可达证据（`guards_and_fallbacks`）、实跑命令及退出码（`verification`）、代码证据隐患（`design_concerns`），并校验完整 Schema 与三态载荷一致性。
+- **强结构化回执与主控核验**：通过 [references/codex-handoff.schema.json](./references/codex-handoff.schema.json) 与 [scripts/lib/schema-validate.mjs](./scripts/lib/schema-validate.mjs) 校验 11 个必填字段的结构与三态载荷一致性（`guards_and_fallbacks`、`verification`、`design_concerns` 等），再由主控对照真实 `git diff` 与契约核查漏报及证据有效性。
 - **权限硬锁与续跑防提权**：`-TaskKind plan|review` 启动前拒绝任何写权限参数；跨 `$RunDir` 续跑若无法从本地状态或 `rollout` 还原原权限，直接报 `unknown_resume_mode` 退出，绝不静默落回 `--yolo`。
 - **脏工作区首轮基线保护**：`-CaptureBaseline` 在首次运行时记录 `HEAD`、`status`、`diff` 与 `diff --cached`，复用 `$RunDir` 开新会话（如遇 `active_writer`）时自动保留首轮基线不覆盖。
 - **实时可观测与桌面直达**：流式写入 `*.events.jsonl`（含实时命令/回复增量与轮中纠偏事件）与 `*.status.json`，支持通过 [scripts/wait-desktop-link.ps1](./scripts/wait-desktop-link.ps1) 快速拿到 `codex://threads/<id>` 链接，并自动将新派单登记到 Codex Desktop 的「Codex 派单」分区。
-- **防过度审查与防过度防御闭环**：严审细则见 [references/review-rubric.md](./references/review-rubric.md)，既用「同类联查 + 棘轮拦截」治改不全与复发坑，也要求主控在反向审查时过滤掉无可达路径的假想防御建议。
+- **防过度审查与防过度防御闭环**：严审细则见 [references/review-rubric.md](./references/review-rubric.md)，既用「同类联查 + 棘轮拦截」治改不全与复发坑，也要求主控在严审时揭穿“仅靠单测夹具”的假证据、核查只写不读死字段，并在反向审查/双盲方案中阻止未经拍板的扩边界防御写入项目规范。
 
 ---
 

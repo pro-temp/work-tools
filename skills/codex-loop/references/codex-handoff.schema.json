@@ -45,15 +45,15 @@
     },
     "guards_and_fallbacks": {
       "type": "array",
-      "description": "Declare EVERY added null/type check, optional chaining, fallback default, try/catch, lock, retry, or compatibility branch, with concrete reachable evidence.",
+      "description": "Declare EVERY added null/type check, optional chaining, fallback default, try/catch, lock, retry, frontend validation/blocking dialog, extra preflight request, or legacy compatibility branch, with concrete real-world reachable evidence.",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["location", "guard", "evidence"],
         "properties": {
           "location": { "type": "string", "description": "file:line or symbol" },
-          "guard": { "type": "string", "description": "Defensive check or fallback added" },
-          "evidence": { "type": "string", "description": "Reachable caller, API contract, or repro showing why it is required" }
+          "guard": { "type": "string", "description": "Defensive check, fallback, blocking prompt, extra request, or compat branch added" },
+          "evidence": { "type": "string", "description": "Real upstream contract, reachable caller, or user flow proving why it is required (synthetic test fixtures alone are not evidence)" }
         }
       }
     },
@@ -78,7 +78,7 @@
     },
     "design_concerns": {
       "type": "array",
-      "description": "Evidence-backed design flaws, mismatched assumptions, review findings (prefix issue with [BLOCKING] or [ADVISORY] during review), or better alternatives noticed in the codebase. Leave empty [] if none; never pad with hypothetical disclaimers.",
+      "description": "Evidence-backed design flaws, mismatched assumptions, review findings (prefix issue with [BLOCKING] or [ADVISORY] during review; classify out-of-contract legacy-compat or frontend-for-backend-validation suggestions as [ADVISORY] rather than [BLOCKING], while keeping regressions against existing active contracts as [BLOCKING]), non-blocking plan tradeoffs, or better alternatives noticed in the codebase. Leave empty [] if none; never pad with hypothetical disclaimers.",
       "items": {
         "type": "object",
         "additionalProperties": false,
